@@ -1,0 +1,865 @@
+; NFX-BO v1 -- bouncing-ball delay on the blend of the two tracks before.
+; Ground-up rebuild, 2026-10-29. See BRIEF.md / DESIGN.md for the spec.
+;
+; Parameter block (Y, relative to r6):
+;   Y+1 NBAL   unipolar_q23   neighbour blend: 0=two back(far) 1=one back(near)
+;   Y+2 GATE   bipolar_q23    capture-window shaping, 0=full window
+;   Y+3 RATE   unipolar_square_q23  initial inter-repeat gap
+;   Y+4 BEND   bipolar_q23    per-repeat gap multiplier, 0=steady
+;   Y+5 DCAY   unipolar_q23   per-repeat level survival, scaled to a 0.99 ceiling
+;   Y+6 MIX    unipolar_q23   dry/wet
+;   Y+7 DECIM  unipolar_q23   capture/playback decimation factor, live-
+;                             adjustable (2026-11-03, replaces the fixed
+;                             .equ this project used through several
+;                             earlier rounds, and replaces the TONE/ALFC
+;                             knobs entirely -- see below). Continuous
+;                             0-127 travel like every other knob, bucketed
+;                             into 8 zones via a single fixed shift
+;                             (raw>>20) at trig time: knob 0-15->DECIM=1,
+;                             16-31->2, 32-47->4, 48-63->8 (matches the old
+;                             fixed default), 64-79->16, 80-95->32,
+;                             96-111->64, 112-127->128. Low settings =
+;                             short, high-fidelity capture (DECIM=1 is
+;                             ~35ms, no decimation aliasing at all);
+;                             high settings = long, deliberately lo-fi
+;                             capture (DECIM=128 is ~4.5s) -- the user's
+;                             own call to make per-capture, not a fixed
+;                             design tradeoff baked in at compile time.
+;                             See the root-cause history below (Y+27/28/30)
+;                             for why this replaced ALFC specifically.
+;
+; TONE (a capture-time highpass, built for an earlier/separate hardware
+; report of low-frequency screech) and ALFC (a capture-time lowpass,
+; built to fight decimation aliasing) were REMOVED 2026-11-03, freeing
+; this file's 7th and 8th (last) parameter slots and ~831 cycles/block of
+; budget. ALFC's whole premise turned out to be unfixable by filtering:
+; a kick's pitch-envelope sweep crosses the decimation Nyquist on every
+; hit, and no FIXED filter cutoff can suppress a sweep at the instant
+; it's crossing, confirmed directly via spectrogram (ghost copies of the
+; kick's own sweep shape, tracking it) before this change. DECIM itself
+; -- raising the Nyquist directly -- is the real fix; ALFC is redundant
+; once that's live-adjustable. TONE still worked correctly for its own
+; original problem but wasn't needed for this one, and the user chose to
+; trade it for budget/slot headroom rather than keep it. Y+8 (ALFC's old
+; slot) is left genuinely unused, not repurposed for anything yet.
+;
+; Persistent state (Y, relative to r6; all free words past the 6 params):
+;   Y+9  TRACKMEM_BASE   this track's TRACK_BUFFERS base word address
+;   Y+10 PHASE           0=IDLE 1=ACTIVE (a trig has fired and the train
+;                        hasn't fully decayed yet). Capture and bounce
+;                        are NOT separate phases of each other -- both
+;                        run concurrently once ACTIVE, each gated only
+;                        by its own state (CAP_WINDOW_REMAIN for capture,
+;                        GAP_REMAIN for bounce). User's explicit
+;                        correction: RATE's gap must count from the
+;                        moment of the trig itself, not from whenever
+;                        capture happens to finish, and capture must
+;                        never be cut short by it either -- the two run
+;                        on independent clocks. (Capture's write-head
+;                        and bounce's read-head advance at the identical
+;                        per-sample rate once bounce starts, so the
+;                        write-head -- already ahead by however many
+;                        samples elapsed before bounce began -- stays
+;                        ahead for the rest of the window; bounce can
+;                        never read past what's actually been captured.)
+;   Y+11 TRIG_FLAG       set by TRIG, consumed once by RENDER
+;   Y+12 CAP_POS         capture write offset, 0..CAP_LEN_FINAL-1
+;   Y+13 CAP_REMAIN      decimated words still to capture (countdown)
+;   Y+14 CAP_DECIM_CTR   real-sample countdown between stored capture words
+;   Y+15 CAP_DELAY_REMAIN real samples to wait before capture starts (GATE>0)
+;   Y+16 CAP_LEN_FINAL   final captured length in words (set when capture ends)
+;   Y+17 BOUNCE_POS      current read/write offset into the captured buffer
+;   Y+18 BOUNCE_DECIM_CTR real-sample countdown for decimated-hold playback
+;   Y+19 GAP_REMAIN      real samples until the next repeat restarts
+;   Y+20 GAP_CUR         current inter-repeat gap, in real samples
+;   Y+21 SAMPLES_REMAINING real samples left in the actively-streaming repeat
+;   Y+22 DCAY_MULT       this block's DCAY parameter scaled to its 0.99 ceiling
+;   Y+23 ACCUM_LEVEL     running compounded level estimate, resets to ~1.0 per trig
+;   Y+24 REPEATS_FIRED   safety counter against MAXREPEATS
+;   Y+25 HELD_WET        continuously-ramping interpolated wet output,
+;                        nudged by INTERP_STEP every sample
+;   Y+26 INTERP_STEP     per-sample increment ramping HELD_WET toward the
+;                        latest target over DECIM samples -- smooths both
+;                        ordinary decimation steps and pass-restart jumps
+;   Y+27 DECIM_CUR       this trig's actual decimation multiplier (1, 2, 4,
+;                        8, 16, 32, 64, or 128), derived once from the
+;                        DECIM knob (Y+7) and latched for the trig's whole
+;                        lifetime -- same once-per-trig-not-per-block
+;                        precedent as GATE/RATE/BEND's own derived state,
+;                        not re-read live like DCAY. Replaces the old
+;                        fixed-at-compile-time ANTIALIAS_LPF filter state
+;                        this word used to hold (removed along with ALFC,
+;                        2026-11-03 -- root cause of the aliasing problem
+;                        ALFC was built to fight: a kick's pitch-envelope
+;                        sweep crosses the decimation Nyquist on every
+;                        hit, and no FIXED filter cutoff can suppress a
+;                        sweep at the instant it's crossing, confirmed via
+;                        spectrogram -- ghost copies of the kick's own
+;                        sweep shape, tracking it. Raising the Nyquist via
+;                        DECIM is the real, direct fix; a user-adjustable
+;                        DECIM supersedes ALFC's whole premise).
+;   Y+28 DECIM_M1_CUR    DECIM_CUR-1, for seeding CAP_DECIM_CTR/
+;                        BOUNCE_DECIM_CTR's countdowns. Replaces the old
+;                        ANTIALIAS_LPF2 filter state (removed with ALFC).
+;   Y+29 CAP_WINDOW_REMAIN real samples left in the fixed capture window,
+;                        counted DOWN from WINDOW_SAMPLES_CUR every sample
+;                        regardless of GATE (a countdown is one
+;                        instruction cheaper per sample than counting up
+;                        and comparing against a constant). Once this
+;                        reaches zero, capture simply stops storing for
+;                        the rest of the trig -- it does NOT touch PHASE
+;                        or bounce in any way (the two run independently,
+;                        see Y+10 above). GATE only ever changes WHAT
+;                        gets captured (via CAP_REMAIN, the word count
+;                        left to store), never WHEN anything happens --
+;                        this word's own countdown is itself independent
+;                        of GATE too, always running the full fixed
+;                        duration regardless.
+;   Y+30 WINDOW_SAMPLES_CUR this trig's actual capture-window duration in
+;                        real samples (BUFLEN*DECIM_CUR), derived once at
+;                        trig time since DECIM is no longer a compile-time
+;                        constant. Replaces TONE's old HPF_LPF_STATE
+;                        tracker (removed with TONE, 2026-11-03).
+;   Y+31 SHIFT_EXP_CUR   the DECIM knob's bucketed exponent (0..7, so
+;                        DECIM_CUR = 1<<SHIFT_EXP_CUR), latched alongside
+;                        DECIM_CUR at trig time. Feeds the interpolation
+;                        step's divide-by-DECIM shift directly (register-
+;                        sourced "asr x0,a,a", confirmed working on the
+;                        real toolchain via dsp56300/cyclecheck/sign_test/
+;                        shift_var_test.asm56k before this was relied on --
+;                        both ASR and ASL accept a register-sourced shift
+;                        count on this hardware, same 1-cycle cost as the
+;                        old hardcoded immediate form it replaces).
+;
+; BITS is deliberately not implemented in v1 (shelved per the user). TONE
+; and ALFC were both implemented at various points but removed 2026-11-03
+; (see the Y+7 DECIM comment above for the full reasoning).
+;
+; Fixed-point notes (empirically verified this session against the real
+; dsp56300 interpreter, not assumed -- see dsp56300/cyclecheck/probe_mpy.cpp):
+;   - mpy of a TRUE Q23 fraction times a PLAIN INTEGER lands correctly in a1
+;     directly, no extra shift needed.
+;   - mpy of two TRUE Q23 fractions also lands correctly in a1 directly.
+;   - mpy of two PLAIN INTEGERS (both small, no fractional intent) needs
+;     "asr a" (undo the hardware's doubled-product convention) followed by
+;     "move a0,a" (relocate the recovered small integer from a0 into a1) --
+;     this exact sequence is copied from NFX-EN's own confirmed-working
+;     TRACKMEM pointer setup, see refs/GOLD_STANDARD.md section 3.
+;   - mpy's source operands must be x0/x1/y0/y1 -- never a0/a1/b0/b1 directly.
+
+
+.equ BUFLEN 1536 ; TRACK_BUFFERS words/track
+; DECIM, DECIM_M1 and WINDOW_SAMPLES are no longer compile-time constants
+; here -- DECIM is now a live knob (Y+7), derived once per trig into
+; DECIM_CUR/DECIM_M1_CUR/WINDOW_SAMPLES_CUR (Y+27/28/30), see the header
+; comment block above. Removed 2026-11-03 along with ALFC.
+.equ GAP_FLOOR 8 ; provisional -- re-measure cycle cost before trusting
+.equ GAP_CEIL 220500 ; 5 seconds -- raised from the original 1-second
+                     ; default, which was clamping BEND's grow/decelerate
+                     ; side well before the brief's "very slow, 1-2
+                     ; repeats per bar" territory, felt as an artificial
+                     ; ceiling. This only affects RATE's own max knob
+                     ; value and the absolute clamp BEND can't exceed --
+                     ; free to raise further, no cycle cost either way.
+.equ GAP_RANGE 220492 ; = GAP_CEIL-GAP_FLOOR, precomputed: the raw assembler
+                     ; doesn't accept a parenthesized expression as an
+                     ; immediate operand
+.equ DCAY_CEIL_Q23 $7eb852 ; 0.99 in Q23 (brief's explicit max)
+.equ HALF_Q23 $400000 ; 0.5, BEND's grow/shrink rate
+.equ LEVEL_THRESHOLD $000800 ; ~-72dB, below this the train is done
+.equ MAXREPEATS 8192 ; safety cap, not the normal stop condition
+
+
+INIT:
+        ; TRACKMEM base = r1 * 1536, rounded up to the next 512-word boundary.
+        ; This exact sequence mirrors NFX-EN's own confirmed-working INIT --
+        ; see refs/GOLD_STANDARD.md section 3.
+        ; CRITICAL: mpy's operand pairing matters on real hardware --
+        ; "mpy y0,y1,a" (both Y-file registers) silently returns ZERO on
+        ; every input, confirmed by direct probe (dsp56300/cyclecheck/
+        ; probe_mpy2.cpp). This was the root cause of a real hardware bug:
+        ; every track ended up computing the SAME (track 0's) TRACKMEM
+        ; base, so a second instance on another track stomped the first's
+        ; buffer. Only "mpy y0,x0,a" (one X-file, one Y-file register) is
+        ; used anywhere in this file now -- do not reintroduce a y0,y1 (or
+        ; any same-file) pairing without re-verifying it against the probe.
+        move r1,y0 ; r1 = this track's number (0-15)
+        move #>BUFLEN,x0
+        mpy y0,x0,a ; confirmed-correct pairing
+        asr a
+        move a0,a ; relocate the small product into a1
+        move a1,y1 ; y1 = track_number*1536 (plain integer offset)
+TRACKMEM:
+        move #>$0,x0 ; placeholder, patched by the loader to track 0's
+                     ; TRACK_BUFFERS base (kind-2 import, symbol 6 -- a
+                     ; plain patched immediate, NOT a service call)
+        move y1,a
+        add x0,a ; + the patched track-0 base (spec's exact formula,
+                  ; no extra rounding needed for our own addressing)
+        move a1,r0
+        move r0,y:(r6+$9)
+
+        ; clear this track's whole TRACK_BUFFERS region -- it may hold
+        ; another machine's data (spec: "clear it before reading").
+        move #>$ffffff,m0
+        clr a
+        rep #BUFLEN
+        move a,y:(r0)+
+
+        clr a
+        move a,y:(r6+$a)
+        move a,y:(r6+$b)
+        move a,y:(r6+$c)
+        move a,y:(r6+$d)
+        move a,y:(r6+$e)
+        move a,y:(r6+$f)
+        move a,y:(r6+$10)
+        move a,y:(r6+$11)
+        move a,y:(r6+$12)
+        move a,y:(r6+$13)
+        move a,y:(r6+$14)
+        move a,y:(r6+$15)
+        move a,y:(r6+$16)
+        move a,y:(r6+$17)
+        move a,y:(r6+$18)
+        move a,y:(r6+$19)
+        move a,y:(r6+$1a)
+        move a,y:(r6+$1b)
+        move a,y:(r6+$1c)
+        move a,y:(r6+$1d)
+        move a,y:(r6+$1e)
+        rts
+
+TRIG:
+        ; one-shot flag, consumed once by RENDER (CH's idiom -- see
+        ; refs/GOLD_STANDARD.md section 1). RENDER does the actual state
+        ; reset so TRIG itself stays trivially cheap.
+        move #>$1,x0
+        move x0,y:(r6+$b)
+        rts
+
+RENDER:
+        ; --- once per block: consume a fresh trig, if any ---
+        move y:(r6+$b),a
+        tst a
+        beq <RENDER_NOTRIG
+        clr a
+        move a,y:(r6+$b)
+
+        ; --- DECIM: bucket the raw knob<<16 value into one of 8 zones via
+        ; a single fixed shift (raw>>20), then derive DECIM_CUR/
+        ; DECIM_M1_CUR/WINDOW_SAMPLES_CUR from it -- all latched once per
+        ; trig (not re-read every block, same precedent as GATE/RATE/BEND
+        ; below), since DECIM is no longer a compile-time constant. Must
+        ; run before GATE's own code just below, which already needs
+        ; DECIM_CUR. x0/x1/y0/y1/a/b are all free scratch here -- this is
+        ; the once-per-trig preamble, before RENDER_LOOP's per-sample body
+        ; where x1 becomes reserved for the dry sample.
+        move y:(r6+$7),a ; DECIM param, raw unipolar_q23 (knob<<16)
+        asr #$14,a,a ; a1 = exponent 0..7 (raw>>20, hex 14 = decimal 20)
+        ; defensive clamp -- MDX spec: "Modulation can produce in-between
+        ; settings", so an LFO-modulated value isn't guaranteed to land
+        ; cleanly in [0,7] even though a plain knob turn always will.
+        tst a
+        bge <DECIM_EXP_NONNEG
+        clr a
+DECIM_EXP_NONNEG:
+        cmp #>7,a
+        ble <DECIM_EXP_OK
+        move #>7,a
+DECIM_EXP_OK:
+        move a1,y:(r6+$1f) ; SHIFT_EXP_CUR
+        move a1,x0 ; x0 = exponent, for the register-sourced ASL below
+        move #>1,a
+        asl x0,a,a ; a1 = DECIM_CUR = 1<<exponent -- register-sourced
+                   ; shift, confirmed working on the real toolchain via
+                   ; dsp56300/cyclecheck/sign_test/shift_var_test.asm56k
+                   ; before this was relied on (both ASR and ASL accept a
+                   ; register-sourced shift count on this hardware, same
+                   ; 1-cycle cost as the old hardcoded immediate form)
+        move a1,y:(r6+$1b) ; DECIM_CUR
+        move a1,y1 ; y1 = DECIM_CUR, kept for the mpy below (mpy needs an
+                   ; x0/x1/y0/y1 source, never a0/a1 directly)
+        move #>1,x0
+        sub x0,a ; a = DECIM_CUR - 1
+        move a1,y:(r6+$1c) ; DECIM_M1_CUR
+        move #>BUFLEN,x0
+        mpy y1,x0,a ; plain integer * plain integer -- small, needs the
+                    ; doubled-product undo (same idiom as TRACKMEM_BASE's
+                    ; own setup in INIT, see refs/GOLD_STANDARD.md
+                    ; section 3)
+        asr a
+        move a0,a
+        move a1,y:(r6+$1e) ; WINDOW_SAMPLES_CUR
+
+        ; GATE shapes the capture window (see DESIGN.md section 7): both
+        ; directions reduce to the same "missing = BUFLEN*|g|" magnitude;
+        ; the sign only decides whether the missing chunk becomes a start
+        ; delay (GATE>0) or is simply never captured (GATE<0).
+        move y:(r6+$2),x0
+        move x0,a
+        tst a
+        bge <GATE_POS
+        ; CRITICAL: "neg a" does NOT correctly negate a value loaded via
+        ; "move y:addr,a" on this hardware -- the accumulator's extension
+        ; bits aren't sign-extended by that load, so negating the full
+        ; (wrongly-positive-looking) extended value leaves a1 unchanged.
+        ; Confirmed by direct probe (dsp56300/cyclecheck/sign_test/
+        ; neg_test.asm56k): neg on $800000 loaded this way gave $800000
+        ; back, not $800000's true negation. Fix: negate via a clean
+        ; zero accumulator against the ORIGINAL data register instead
+        ; (the same "clr a / sub x0,a" shape already proven correct
+        ; elsewhere, e.g. the 1-MIX calc).
+        ; Q23 can't represent +1.0 (max is $7fffff), so negating the exact
+        ; extreme -1.0 ($800000, a real reachable knob position per spec:
+        ; "0 becomes -1") would overflow right back to $800000. Checking
+        ; the SIGN of that overflowed result with "tst/bge" does NOT catch
+        ; it -- confirmed by direct probe (clamp_test.asm56k) that "bge"
+        ; takes the branch anyway after this specific overflow, because
+        ; signed bge is overflow-aware (N xor V) and the TRUE mathematical
+        ; result (+8388608) really is >=0, even though it can't fit in 24
+        ; bits. So: special-case the one bad input via exact equality
+        ; (zero-flag based, not overflow-sensitive -- confirmed via
+        ; eq_test.asm56k) BEFORE attempting the subtraction at all.
+        cmp #>$800000,a
+        beq <GATE_NEG_MIN
+        clr a
+        sub x0,a
+        bra <GATE_NEG_OK
+GATE_NEG_MIN:
+        move #>$7fffff,a
+GATE_NEG_OK:
+        move a1,y0 ; y0 = |GATE|
+        move #>BUFLEN,x0
+        mpy y0,x0,a ; true fraction * plain integer: a1
+                                         ; lands correctly, no shift needed
+        move a1,x0 ; x0 = missing words
+        move #>BUFLEN,a
+        sub x0,a ; a = CAP_REMAIN = BUFLEN - missing
+        move a1,y:(r6+$d)
+        move a1,y:(r6+$10)
+        clr a
+        move a,y:(r6+$f) ; GATE<0: stop early, no start delay
+        bra <GATE_DONE
+GATE_POS:
+        move a1,y0 ; y0 = GATE (already >=0)
+        move #>BUFLEN,x0
+        mpy y0,x0,a
+        move a1,x1 ; x1 = missing words
+        move #>BUFLEN,a
+        sub x1,a ; a = CAP_REMAIN = BUFLEN - missing
+        move a1,y:(r6+$d)
+        move a1,y:(r6+$10)
+        move x1,y1 ; y1 = missing words (mpy needs an
+                                         ; x0/x1/y0/y1 source, never a0/a1)
+        move y:(r6+$1b),x0 ; DECIM_CUR (derived above, no longer a .equ)
+        mpy y1,x0,a ; plain int * plain int -- small
+        asr a
+        move a0,a ; relocate into a1
+        move a1,y:(r6+$f)
+GATE_DONE:
+        clr a
+        move a,y:(r6+$c)
+        move y:(r6+$1e),x0 ; WINDOW_SAMPLES_CUR (derived above)
+        move x0,y:(r6+$1d) ; CAP_WINDOW_REMAIN = WINDOW_SAMPLES_CUR (counts
+                           ; down, not up -- cheaper per-sample check,
+                           ; see below)
+        move y:(r6+$1c),x0 ; DECIM_M1_CUR (derived above)
+        move x0,y:(r6+$e)
+        move #>1,a
+        move a,y:(r6+$a) ; PHASE = ACTIVE (capture and bounce now run
+                         ; concurrently, each gated on its own state --
+                         ; see the per-sample loop; PHASE itself is just
+                         ; "has a train been triggered and not yet fully
+                         ; decayed", 0=IDLE 1=ACTIVE)
+
+        ; RATE sets the gap before repeat 1, counted from THIS instant
+        ; (the trig/start of capture), not from whenever capture happens
+        ; to finish -- user's explicit correction: "R should count from
+        ; the BEGINNING of the step that is being captured." The gap
+        ; countdown below runs unconditionally once PHASE=ACTIVE,
+        ; independent of capture's own progress; capture keeps running
+        ; concurrently on its own clock (see CAP_WINDOW_REMAIN below),
+        ; never cut short -- the two don't interact at all. (This also
+        ; cancels whatever bounce was mid-flight; fresh trig always
+        ; starts over, per the brief.)
+        move y:(r6+$3),y0 ; already-squared true fraction
+        move #>GAP_RANGE,x0
+        mpy y0,x0,a ; fraction * plain integer, no shift
+        move #>GAP_FLOOR,x0
+        add x0,a
+        move a1,y:(r6+$14)
+        move a1,y:(r6+$13)
+        clr a
+        move a,y:(r6+$11) ; BOUNCE_POS=0
+        move a,y:(r6+$12) ; BOUNCE_DECIM_CTR=0
+        move a,y:(r6+$15) ; SAMPLES_REMAINING=0 -- nothing streams until
+                          ; the gap countdown above reaches zero
+        move a,y:(r6+$18) ; REPEATS_FIRED=0 (NOT redundant -- the BOUNCE
+                          ; restart logic reads this directly, nothing
+                          ; else resets it)
+        move a,y:(r6+$19) ; HELD_WET=0 -- found by naive review: without
+                          ; this, a fresh trig that interrupts a still-
+                          ; audible bounce train leaks that OLD train's
+                          ; ramped amplitude into the new one's first
+                          ; streamed samples, in tension with "whatever
+                          ; was still playing is cancelled, starts
+                          ; completely fresh."
+        move a,y:(r6+$1a) ; INTERP_STEP=0, same reasoning
+        move #>$7fffff,a
+        move a,y:(r6+$17)
+RENDER_NOTRIG:
+
+        ; --- once per block: DCAY's multiplier, scaled to its 0.99 ceiling ---
+        move y:(r6+$5),x0
+        move #>DCAY_CEIL_Q23,y0
+        mpy x0,y0,a ; true fraction * true fraction
+        move a1,y:(r6+$16)
+
+        ; (TONE's HPF_K/1-HPF_K and ALFC's LPF_K/ONE_MINUS_LPF_K setup
+        ; used to be cached here, once per block, into n2/n4/n5/n6 --
+        ; removed 2026-11-03 along with TONE and ALFC themselves. n2/n4/
+        ; n5/n6 are free scratch registers again.)
+
+        ; --- neighbour buffers for this block's dry signal (NBAL) --
+        ; carried forward from the old build's confirmed-good linear
+        ; crossfade -- see DESIGN.md section 2.
+        move y:>$7f0,r5
+        move #>$ffffff,m5
+        move y:(r5+2),r2 ; two back
+        move y:(r5+1),r5 ; one back
+        move #>$ffffff,m2
+
+        move y:(r6+$9),r3 ; r3 = this track's buffer base,
+        move #>$ffffff,m3 ; reused each sample below; must be
+                                         ; linear, RENDER does not reset M3
+
+        ; --- once per block: NBAL and MIX are per-block constants, but
+        ; the per-sample loop was recomputing/re-fetching their derived
+        ; values on all 32 samples every time (found via a naive review
+        ; against the stock machines' own hot loops, which always hoist
+        ; anything block-constant into a spare register ONCE rather than
+        ; re-deriving it per sample). Cache them here instead -- r1, r4,
+        ; n0, n1 are all otherwise unused anywhere in RENDER_LOOP.
+        move #>$7fffff,a
+        move y:(r6+$1),y0 ; NBAL
+        sub y0,a ; a = 1-NBAL
+        move a1,n0 ; n0 = cached 1-NBAL
+        move y:(r6+$1),n1 ; n1 = cached NBAL
+
+        ; MIX, with the same knob=127-snaps-to-exactly-zero-dry fix as
+        ; before, just computed once per block instead of once per sample.
+        move y:(r6+$6),a ; MIX
+        ; firmware's unipolar_q23 encoding of knob=127 (knob<<16) is
+        ; short of Q23's true $7fffff ceiling, so a plain 1-MIX calc
+        ; leaves a small dry residual at max knob position; snap to
+        ; exactly zero there instead.
+        cmp #>$7f0000,a
+        bge <PRE_MIX_FULL_WET
+        move #>$7fffff,a
+        move y:(r6+$6),x0
+        sub x0,a
+        move a1,r1 ; r1 = cached 1-MIX
+        bra <PRE_MIX_DONE
+PRE_MIX_FULL_WET:
+        clr a
+        move a1,r1 ; r1 = cached 1-MIX (exactly zero, full wet)
+PRE_MIX_DONE:
+        move y:(r6+$6),r4 ; r4 = cached MIX
+
+RENDER_LOOP:
+        do #32,RENDER_END
+        ; dry = two_back*(1-NBAL) + one_back*NBAL
+        ;
+        ; CRITICAL: this used to be computed as "two_back + NBAL*(one_back
+        ; -two_back)", truncating the (one_back-two_back) delta to a1
+        ; immediately -- the SAME overflow bug as the anti-alias filter
+        ; above (see that comment for the full explanation): the delta can
+        ; mathematically reach +/-2.0, overflowing Q23's +/-1.0 range, and
+        ; wraps to a corrupted value on exactly the kind of sharp transient
+        ; a real drum hit produces. Reported on hardware as the DRY signal
+        ; itself sounding like "a very very low quality copy." Rewritten
+        ; as a convex combination (same proof of safety as the filter
+        ; above and the dry/wet output mix below: weights 1-NBAL and NBAL
+        ; are both >=0 and sum to 1, so the result is bounded by whichever
+        ; input has the larger magnitude -- cannot overflow).
+        move y:(r2)+,x0 ; x0 = two_back
+        move y:(r5)+,y1 ; y1 = one_back
+        move n0,y0 ; y0 = cached 1-NBAL (hoisted above, block-constant)
+        mpy x0,y0,a ; a = two_back*(1-NBAL)
+        move n1,x0 ; x0 = cached NBAL
+        macr y1,x0,a ; a += one_back*NBAL -- convex combo, cannot
+                     ; overflow; macr accumulates directly onto the
+                     ; running a, no stash-through-b needed (confirmed-
+                     ; safe pairing: y-file*x-file, same as elsewhere)
+        move a1,x1 ; x1 = dry sample, kept for the tail
+
+        ; b defaults to silence (this sample's wet output) regardless of
+        ; what follows -- must run unconditionally, even on fully-idle
+        ; samples, since the output mix at the end of this loop always
+        ; reads it.
+        clr b
+
+        ; --- single shared gate: PHASE=0 (fully idle) skips BOTH the
+        ; capture logic below AND the bounce logic after it in one
+        ; check, instead of each block separately re-testing phase.
+        ; Once a trig has fired (PHASE=ACTIVE), capture and bounce run
+        ; CONCURRENTLY -- not as mutually-exclusive phases -- each gated
+        ; only by its own internal state (CAP_WINDOW_REMAIN for capture,
+        ; GAP_REMAIN for bounce). This is the redesign for "R should
+        ; count from the beginning of the step being captured": the gap
+        ; countdown no longer waits for capture to finish at all, and
+        ; capture is never cut short by it either -- the write-head
+        ; (capture) and read-head (bounce playback) advance at the exact
+        ; same rate once bounce starts, so the write-head -- already
+        ; ahead by however many samples elapsed before bounce began --
+        ; stays ahead for the rest of the window; bounce can never read
+        ; past what's actually been captured.
+        move y:(r6+$a),a
+        tst a
+        beq <SKIP_BOUNCE
+
+        ; --- CAPTURE: store a decimated word, when its own state says so ---
+
+        ; CAPTURE's DURATION is fixed real time (WINDOW_SAMPLES),
+        ; independent of GATE -- NOT however many words CAP_REMAIN says
+        ; still need storing (GATE is only supposed to select what gets
+        ; captured, never affect timing at all -- see BRIEF.md). This
+        ; countdown is now ALSO independent of bounce entirely: once it
+        ; hits zero, capture just stops storing for the rest of this
+        ; trig (falls through to SKIP_CAPTURE below every sample from
+        ; then on) -- it does NOT touch PHASE or anything bounce-related.
+        move y:(r6+$1d),a
+        sub #>1,a
+        move a1,y:(r6+$1d)
+        ; no separate "tst a" needed -- a plain "move" does not affect
+        ; the condition codes on this hardware (confirmed via the real
+        ; asm56.exe toolchain + dsp56300 interpreter, dsp56300/cyclecheck/
+        ; sign_test/move_flags_test.asm56k), so "sub"'s own flags are
+        ; still valid here.
+        ble <SKIP_CAPTURE
+
+        ; (The anti-alias LPF cascade and TONE's highpass used to run
+        ; here, every real sample while capturing -- removed 2026-11-03.
+        ; The real fix for decimation aliasing turned out to be the DECIM
+        ; knob itself [raising the Nyquist directly], not filtering before
+        ; capture: a kick's pitch-envelope sweep crosses whatever Nyquist
+        ; is in effect on every hit, and no FIXED filter cutoff can
+        ; suppress a sweep at the exact instant it's crossing, confirmed
+        ; via spectrogram before this change. CAP_STORE below now stores
+        ; the raw dry sample [x1] directly -- no filtered copy exists
+        ; anymore, Y+27/28/30 are DECIM_CUR/DECIM_M1_CUR/
+        ; WINDOW_SAMPLES_CUR instead of filter state.)
+
+        move y:(r6+$f),a
+        tst a
+        ble <CAP_ACTIVE
+        sub #>1,a
+        move a1,y:(r6+$f)
+        bra <SKIP_CAPTURE
+CAP_ACTIVE:
+        ; CAP_REMAIN<=0 now just means "nothing left to store this trig"
+        ; -- it no longer ends the phase (see the CAP_ELAPSED/
+        ; WINDOW_SAMPLES check above, which is the only thing that does
+        ; that now). Simply idle (dry still plays, nothing gets written)
+        ; until the fixed window elapses.
+        move y:(r6+$d),a
+        tst a
+        ble <SKIP_CAPTURE
+        move y:(r6+$e),a
+        tst a
+        ble <CAP_STORE
+        sub #>1,a
+        move a1,y:(r6+$e)
+        bra <SKIP_CAPTURE
+CAP_STORE:
+        move y:(r6+$1c),a ; DECIM_M1_CUR (derived once per trig above)
+        move a1,y:(r6+$e)
+        move y:(r6+$c),a
+        move a1,n3
+        move x1,y:(r3+n3) ; raw dry sample, no anti-alias filter anymore
+                          ; (TONE/ALFC removed 2026-11-03 -- the real fix
+                          ; for aliasing is the DECIM knob, not filtering)
+        add #>1,a
+        move a1,y:(r6+$c)
+        move y:(r6+$d),a
+        sub #>1,a
+        move a1,y:(r6+$d)
+        bra <SKIP_CAPTURE
+SKIP_CAPTURE:
+
+        ; --- BOUNCE: gap countdown always runs, from the trig itself
+        ; onward, regardless of whether capture (above) is still active
+        ; -- already confirmed active by the shared PHASE check earlier
+        ; in this loop, no separate re-check needed here. ---
+
+        ; gap countdown -- may restart a repeat even if one is still streaming.
+        ; CRITICAL: the decrement must be written back on EVERY sample, not
+        ; only when a restart happens -- without this, GAP_REMAIN never
+        ; actually counts down in memory (each sample re-reads the same
+        ; stale value, decrements it in a register, and discards it), so
+        ; the gap never expires and only the first (directly-kicked-off)
+        ; bounce ever plays. Found via dynamic simulation (sim_nfxbo_v1),
+        ; not by inspection -- gapRemain was observed stuck at its initial
+        ; value for 700+ blocks straight.
+        move y:(r6+$13),a
+        sub #>1,a
+        move a1,y:(r6+$13)
+        ; same "move doesn't touch CCR" fact as the CAP_WINDOW_REMAIN
+        ; check above -- no separate "tst a" needed.
+        bgt <GAP_KEEP
+        ; restart: compute the next gap via BEND, then begin a fresh pass
+        move y:(r6+$4),x0
+        move x0,a
+        tst a
+        bge <BEND_GROW
+        ; "neg a" is wrong here for the same reason as GATE's negative
+        ; branch above -- see that comment. Also same Q23 extreme-negation
+        ; overflow trap as GATE's branch (bge is overflow-aware and will
+        ; NOT catch the $800000-stays-$800000 case) -- same exact-equality
+        ; pre-check fix.
+        cmp #>$800000,a
+        beq <BEND_NEG_MIN
+        clr a
+        sub x0,a
+        bra <BEND_NEG_OK
+BEND_NEG_MIN:
+        move #>$7fffff,a
+BEND_NEG_OK:
+        ; Compress the shrink range so the WHOLE knob travel (0 to -64)
+        ; produces a smooth, continuously-varying effect with no flat/
+        ; clamped region anywhere -- user reported the knob was saturating
+        ; (reaching max effective shrink, with no further change) around
+        ; display -40 out of the true minimum -64, and explicitly wants
+        ; the value that USED to appear at -40 to now appear at -64
+        ; instead, smoothly spread across the full travel in between (an
+        ; earlier attempt that STRETCHED the input and clamped past a
+        ; threshold was wrong -- that still left a flat/clamped region,
+        ; exactly what was rejected). The correct fix is the opposite
+        ; direction: scale |BEND| DOWN by 0.625 (=40/64) before squaring,
+        ; so the true knob extreme (|BEND|=1.0) feeds the formula exactly
+        ; what 0.625 used to feed it (i.e. what display -40 used to give),
+        ; and every value in between scales down proportionally -- smooth,
+        ; monotonic, no clamp needed at all (0.625x can never exceed 1.0,
+        ; so this can't overflow regardless of input). Only applied to
+        ; this (shrink) branch -- grow/decelerate stays exactly as
+        ; before, per the user's explicit request.
+        move a1,x0 ; x0 = |BEND|
+        move #>$500000,y0 ; 0.625 = 40/64
+        mpy x0,y0,a ; a = |BEND|*0.625 -- cannot overflow
+        ; Square before scaling -- user feedback (separate from the
+        ; compression above): with a plain linear mapping, almost the
+        ; entire usable shrink range collapsed into a small part of the
+        ; knob's travel (compounding across many repeats makes a linear
+        ; per-repeat delta feel sharply nonlinear overall). Squaring
+        ; (x0,x0 -- EN's own confirmed-real parameter-squaring idiom, see
+        ; GOLD_STANDARD section 2) spreads the gentle end out further.
+        move a1,x0 ; x0 = |BEND| (compressed)
+        mpy x0,x0,a ; a = |BEND|^2
+        move a1,y0 ; y0 = |BEND|^2
+        move #>HALF_Q23,x0
+        mpy y0,x0,a ; true fraction * true fraction
+        move a1,y0 ; y0 = |BEND|^2 * 0.5
+        move y:(r6+$14),a
+        move a1,x0 ; x0 = current gap (plain integer)
+        mpy x0,y0,a ; plain integer * true fraction: a1
+                                         ; lands correctly, no shift needed
+        ; CRITICAL: must NOT use x1 as scratch here -- x1 holds this
+        ; sample's dry signal, live across the WHOLE per-sample loop body
+        ; until the final output mix reads it. Clobbering it here
+        ; corrupted the dry output itself (not just wet) on any sample
+        ; where a BEND restart happens -- reported on hardware as "fully
+        ; dry gives some bounce delay." Use y1 instead, which is free here.
+        move a1,y1 ; y1 = shrink delta
+        move y:(r6+$14),a
+        sub y1,a
+        bra <BEND_CLAMP
+BEND_GROW:
+        move a1,y0 ; y0 = BEND (already >=0)
+        move #>HALF_Q23,x0
+        mpy y0,x0,a
+        move a1,y0 ; y0 = BEND*0.5
+        move y:(r6+$14),a
+        move a1,x0
+        mpy x0,y0,a
+        move a1,y1 ; y1 = grow delta (NOT x1 -- see comment above)
+        move y:(r6+$14),a
+        add y1,a
+BEND_CLAMP:
+        move #>GAP_FLOOR,x0
+        cmp x0,a
+        bge <BEND_CLAMP_HI
+        move x0,a
+BEND_CLAMP_HI:
+        move #>GAP_CEIL,x0
+        cmp x0,a
+        ble <BEND_CLAMPED
+        move x0,a
+BEND_CLAMPED:
+        move a1,y:(r6+$14)
+        move a1,y:(r6+$13)
+
+        ; safety cap and decay-based stop, checked once per restart (not
+        ; once per sample -- cheap).
+        move y:(r6+$18),a
+        add #>1,a
+        move a1,y:(r6+$18)
+        cmp #>MAXREPEATS,a
+        bge <BOUNCE_STOP
+        ; the restart that just fired bounce #1 (REPEATS_FIRED now ==1)
+        ; is the pristine capture -- DCAY doesn't degrade anything until
+        ; the SECOND pass (same reasoning as BOUNCE_ADVANCE_FIRST below).
+        ; Found by naive review: without this exemption, DCAY at/near its
+        ; minimum knob position multiplies ACCUM_LEVEL straight to (near)
+        ; zero before bounce #1 ever streams, trips LEVEL_THRESHOLD, and
+        ; silences the WHOLE train immediately -- contradicts the brief's
+        ; "not silent after one bounce."
+        cmp #>1,a
+        beq <BOUNCE_BEGIN_PASS
+        move y:(r6+$17),x0
+        move y:(r6+$16),y0
+        mpy x0,y0,a ; true fraction * true fraction
+        move a1,y:(r6+$17)
+        cmp #>LEVEL_THRESHOLD,a
+        blt <BOUNCE_STOP
+BOUNCE_BEGIN_PASS:
+
+        ; begin a fresh pass through the captured buffer. decim ctr=0 (not
+        ; DECIM_M1) so the first streamed sample of this new pass advances
+        ; immediately instead of holding over the previous pass's stale
+        ; value for up to DECIM_M1 samples.
+        clr a
+        move a,y:(r6+$11)
+        move a,y:(r6+$12)
+        move y:(r6+$10),a
+        move a1,y1 ; y1 = CAP_LEN_FINAL (mpy needs an
+                                         ; x0/x1/y0/y1 source, never a0/a1)
+        move y:(r6+$1b),x0 ; DECIM_CUR (derived once per trig above)
+        mpy y1,x0,a ; plain int * plain int -- small
+        asr a
+        move a0,a ; relocate into a1
+        move a1,y:(r6+$15)
+        bra <GAP_KEEP
+BOUNCE_STOP:
+        clr a
+        move a,y:(r6+$a) ; back to IDLE: train has run its course
+        move a,y:(r6+$15)
+GAP_KEEP:
+
+        ; stream the active repeat, if any, one real sample at a time.
+        ; Decimated-hold playback with LINEAR INTERPOLATION: a hard
+        ; zero-order hold (repeat the same value for DECIM samples then
+        ; jump) is a classic source of harsh aliasing, and makes every
+        ; repeat-restart an instant jump to buffer[0] -- both reported as
+        ; an unacceptable high-pitched artifact. Fix: HELD_WET is now a
+        ; continuously-ramping value, nudged by INTERP_STEP every single
+        ; sample (hold or advance alike) toward whatever target was set at
+        ; the last advance -- so both ordinary decimation steps AND pass
+        ; restarts glide smoothly over DECIM samples instead of jumping.
+        move y:(r6+$15),a
+        tst a
+        ble <SKIP_BOUNCE
+        sub #>1,a
+        move a1,y:(r6+$15)
+        move y:(r6+$1a),x0 ; INTERP_STEP
+        move y:(r6+$19),a ; HELD_WET (current ramped value)
+        add x0,a
+        move a1,y:(r6+$19)
+        move a1,b ; b = this sample's wet output
+        move y:(r6+$12),a
+        tst a
+        ble <BOUNCE_ADVANCE
+        sub #>1,a
+        move a1,y:(r6+$12)
+        bra <SKIP_BOUNCE
+BOUNCE_ADVANCE:
+        move y:(r6+$1c),a ; DECIM_M1_CUR (derived once per trig above)
+        move a1,y:(r6+$12)
+        move y:(r6+$11),a
+        move a1,n3
+        move y:(r3+n3),x0 ; raw = buffer[pos]
+        move y:(r6+$18),a ; REPEATS_FIRED
+        cmp #>1,a
+        beq <BOUNCE_ADVANCE_FIRST
+        move y:(r6+$16),y0
+        mpy x0,y0,a ; a = processed = raw * DCAY_MULT (new target)
+        move a1,y:(r3+n3) ; write back in place (compounds)
+        ; CRITICAL: must NOT use x1 here either -- same reason as the BEND
+        ; restart code above (x1 holds this sample's dry signal, live
+        ; until the final output mix). Use y1 instead.
+        move a1,y1 ; y1 = processed (new target)
+        bra <BOUNCE_ADVANCE_DONE
+BOUNCE_ADVANCE_FIRST:
+        ; the first pass through the buffer (REPEATS_FIRED==1) is the
+        ; pristine capture -- DCAY only starts compounding from the
+        ; second pass onward (per the brief), so leave the buffer
+        ; untouched and feed the raw sample straight to the interpolator.
+        move x0,a
+        move a1,y1 ; y1 = raw (unprocessed)
+BOUNCE_ADVANCE_DONE:
+        ; CRITICAL (found 2026-11-03, real bug, confirmed against the user's
+        ; own hardware recordings): this used to compute step as
+        ; (target>>4) - (current>>4), shifting EACH operand down by 4 bits
+        ; BEFORE subtracting -- reasoning at the time was "a few LSBs less
+        ; precise, irrelevant at this interpolation granularity." That
+        ; reasoning only holds for a LOUD signal. For a QUIET one -- and
+        ; every repeat's tail, or any quiet passage, is exactly that --
+        ; most of the signal's actual information lives in precisely the
+        ; low 4 bits this throws away independently from each operand
+        ; (e.g. a signal at ~0.00012 of full scale is only ~1000 raw Q23
+        ; units; discarding up to 15 units from EACH of two operands before
+        ; combining is a multi-percent error on a value that small, not a
+        ; "few LSBs"). The result was a persistent, roughly fixed-magnitude
+        ; staircase artifact riding on top of the real (decaying) signal --
+        ; audible as a steady high-pitched ring/tone (confirmed via
+        ; spectrogram + direct time-aligned amplitude analysis of real
+        ; recordings: artifact-to-signal ratio was ~0.02-0.07 in quiet
+        ; passages vs ~0.0002-0.002 in loud ones, while the artifact's own
+        ; ABSOLUTE size barely changed between them -- the signature of a
+        ; fixed quantization floor, not content-dependent aliasing, which
+        ; is exactly why ALFC (a pre-capture filter) had zero effect on it
+        ; no matter how it was set).
+        ;
+        ; Fixed using the SAME already-proven-safe pattern used elsewhere
+        ; in this file (the anti-alias filter, the HPF) for exactly this
+        ; "subtract two independently-bounded values without overflowing"
+        ; problem: subtract in the FULL accumulator first (captures the
+        ; true difference even past +/-1.0, so it cannot overflow), THEN
+        ; shift the result down ONCE at the end -- one truncation instead
+        ; of two, done on the full-precision difference instead of on each
+        ; operand independently, so quiet signals keep their precision.
+        move y1,a ; a = target (full accumulator)
+        move y:(r6+$19),x0 ; x0 = HELD_WET (current)
+        sub x0,a ; a = target - current, full accumulator -- exact even
+                 ; past +/-1.0, same proof as the HPF/anti-alias subtracts
+        asr #$3,a,a ; a = (target-current)/8, single truncation, from the
+                    ; full-precision difference -- shift amount matches
+                    ; DECIM (now 8, was 16/shift-by-4): the ramp must
+                    ; reach the new target in exactly DECIM hold-samples,
+                    ; so this HAS to track DECIM's own value, not be
+                    ; independently chosen
+        move a1,y:(r6+$1a) ; new INTERP_STEP, ramps toward target over the
+                           ; next DECIM_M1 hold-samples
+        move y:(r6+$11),a
+        add #>1,a
+        move y:(r6+$10),x0
+        cmp x0,a
+        blt <BOUNCE_NOWRAP
+        clr a
+BOUNCE_NOWRAP:
+        move a1,y:(r6+$11)
+SKIP_BOUNCE:
+
+        ; --- output: dry*(1-MIX) + wet*MIX --- (MIX/1-MIX cached once
+        ; per block above, in r1/r4 -- not recomputed per sample)
+        move r1,y0 ; y0 = cached 1-MIX
+        mpy x1,y0,a ; dry(x1) * (1-MIX)(y0) -- x1 is
+                                         ; already a valid mpy source, no
+                                         ; need to round-trip through a1
+        move r4,y0 ; y0 = cached MIX
+        move b1,x0 ; x0 = wet sample
+        macr x0,y0,a ; a = dry*(1-MIX) + wet*MIX, rounded
+        move a,y:(r7)+
+RENDER_END:
+        rts
+

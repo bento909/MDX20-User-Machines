@@ -1,0 +1,27 @@
+{
+  "id": "org.mathsmechanic.nfxbo",
+  "display_name": "NFX-BO",
+  "description": "trig-gated, discretely-repeating bouncing-ball delay on a blend of the two tracks before (v1, from-scratch rebuild)",
+  "category": "NFX",
+  "short_label": "BO",
+  "neighbour": true,
+  "params": [
+    { "name": "NBAL", "default": 0, "transform": "unipolar_q23" },
+    { "name": "GATE", "default": 64, "transform": "bipolar_q23" },
+    { "name": "RATE", "default": 32, "transform": "unipolar_square_q23" },
+    { "name": "BEND", "default": 64, "transform": "bipolar_q23" },
+    { "name": "DCAY", "default": 80, "transform": "unipolar_q23" },
+    { "name": "MIX", "default": 96, "transform": "unipolar_q23" },
+    { "name": "TONE", "default": 0, "transform": "unipolar_q23" },
+    { "name": "ALFC", "default": 33, "transform": "unipolar_q23" }
+  ],
+  "program": {
+    "y_workset_words": 31,
+    "relocations": [
+      "RENDER_LOOP"
+    ],
+    "imports": [
+      { "symbol": "TRACKMEM", "abi_symbol": 6 }
+    ]
+  }
+}
