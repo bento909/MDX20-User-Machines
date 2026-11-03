@@ -1,64 +1,41 @@
-# NFX-BO
+# MDX 2.0 User Machines
 
-A custom Elektron Machinedrum "User Machine" (NFX effect category) — on each
-trig, captures a short blend of the two tracks before it and plays it back as
-a series of discrete, decaying, bouncing-ball-style echoes. See `BRIEF.md` for
-the design brief (what it should sound/feel like) and `DESIGN.md` for the
-technical design (parameter transforms, memory layout, state machine).
+Custom DSP56300 "User Machines" for the Elektron Machinedrum, built against
+MDX's X.20 ("MDX 2.0") USR-machine system — installable custom synthesis/
+effects code that runs directly on the Machinedrum's own DSP.
 
-## Status
+Each machine lives in its own subfolder, with its own README covering what
+it does, its parameters, build/install instructions, and status.
 
-v1 (NBAL/GATE/RATE/BEND/DCAY/MIX — TONE/BITS deferred) is implemented,
-assembled, packed, and cycle-checked. **Hardware testing is in progress**; see
-`TODO.md` for the current round of fixes and what's still unverified by ear.
+## Machines
 
-## Repo contents
+- [`NFX-BO/`](NFX-BO/) — a bouncing-ball delay: captures a short, decimated
+  blend of the two tracks before it on each trig, then plays it back as a
+  series of discrete, decaying, bouncing echoes. In active development.
 
-- `BRIEF.md` — design brief
-- `DESIGN.md` — technical design notes
-- `NFXBO.asm56k` — DSP56300 assembly source (the machine itself)
-- `NFXBO.json` — machine manifest (parameters, transforms, memory/import declarations)
-- `NFXBO.lod` / `NFXBO.mds` / `NFX-BO.syx` — build outputs (see Build below)
-- `NFXBO.symbols.json` — label/address table from the assembler
-- `TODO.md` — open items and hardware-test history
+## `refs/`
+
+Local-only reference material (disassembled stock Elektron NFX machines,
+used as a gold standard for how to correctly structure an NFX-category
+machine) — **not tracked in this repo** (see `.gitignore`); it's
+disassembled from Elektron's proprietary factory firmware and isn't
+redistributable. Useful to have alongside this repo when building a new
+machine, but it travels separately, not with the git history.
 
 ## Build toolchain (external — not included in this repo)
 
-Building from source needs three separate external tools, cloned as sibling
-directories rather than vendored here:
+Building any machine here from source needs three separate external tools,
+cloned as sibling directories rather than vendored:
 
-- [`kitbasher`](https://github.com/etcetc000/kitbasher) (GPLv3) — supplies the
-  real DSP56300 cross-assembler used as the `.asm56k` front end.
-- [`MDS`](https://github.com/jmamma/MDS) — supplies the packaging/sysex-conversion
-  tools and the official Machine Dump Standard spec.
+- [`kitbasher`](https://github.com/etcetc000/kitbasher) (GPLv3) — supplies
+  the real DSP56300 cross-assembler used as the `.asm56k` front end.
+- [`MDS`](https://github.com/jmamma/MDS) — supplies the packaging/sysex-
+  conversion tools and the official Machine Dump Standard spec.
 - [`dsp56300`](https://github.com/dsp56300/dsp56300) (GPLv3) — DSP56300
-  emulator; only needed if you want to cycle-check or simulate, not required
-  to build.
+  emulator; only needed for cycle-checking/simulating, not required to
+  build.
 
-### Build steps
-
-```sh
-# 1. assemble: .asm56k -> .lod
-python tools/mds_assemble.py NFXBO.asm56k --out NFXBO.lod --symbols-out NFXBO.symbols.json
-
-# 2. package: .json + .lod -> .mds
-python MDS/tools/mds_pack.py NFXBO.json NFXBO.lod --format lod -o NFXBO.mds
-
-# 3. transfer-encode: .mds -> .syx
-python MDS/tools/mds_to_syx.py NFXBO.mds --slot 1 -o NFX-BO.syx
-```
-
-(adjust paths to wherever you clone each dependency)
-
-Flash the resulting `NFX-BO.syx` to the Machinedrum over MIDI to install it
-into a USR machine slot (U01–U16). Only install machine code from sources you
-trust — it runs directly on the DSP.
-
-## Not included
-
-This repo deliberately excludes any disassembled/extracted Elektron factory
-firmware content used during development (see `.gitignore`) — that material
-is proprietary and isn't redistributable.
+See each machine's own README for its exact build steps.
 
 ## License
 

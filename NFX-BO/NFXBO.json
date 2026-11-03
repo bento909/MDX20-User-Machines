@@ -12,11 +12,10 @@
     { "name": "BEND", "default": 64, "transform": "bipolar_q23" },
     { "name": "DCAY", "default": 80, "transform": "unipolar_q23" },
     { "name": "MIX", "default": 96, "transform": "unipolar_q23" },
-    { "name": "TONE", "default": 0, "transform": "unipolar_q23" },
-    { "name": "ALFC", "default": 33, "transform": "unipolar_q23" }
+    { "name": "RVRS", "default": 127, "transform": "bipolar_q23" }
   ],
   "program": {
-    "y_workset_words": 31,
+    "y_workset_words": 30,
     "relocations": [
       "RENDER_LOOP"
     ],

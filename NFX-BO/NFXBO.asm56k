@@ -8,40 +8,46 @@
 ;   Y+4 BEND   bipolar_q23    per-repeat gap multiplier, 0=steady
 ;   Y+5 DCAY   unipolar_q23   per-repeat level survival, scaled to a 0.99 ceiling
 ;   Y+6 MIX    unipolar_q23   dry/wet
-;   Y+7 DECIM  unipolar_q23   capture/playback decimation factor, live-
-;                             adjustable (2026-11-03, replaces the fixed
-;                             .equ this project used through several
-;                             earlier rounds, and replaces the TONE/ALFC
-;                             knobs entirely -- see below). Continuous
-;                             0-127 travel like every other knob, bucketed
-;                             into 8 zones via a single fixed shift
-;                             (raw>>20) at trig time: knob 0-15->DECIM=1,
-;                             16-31->2, 32-47->4, 48-63->8 (matches the old
-;                             fixed default), 64-79->16, 80-95->32,
-;                             96-111->64, 112-127->128. Low settings =
-;                             short, high-fidelity capture (DECIM=1 is
-;                             ~35ms, no decimation aliasing at all);
-;                             high settings = long, deliberately lo-fi
-;                             capture (DECIM=128 is ~4.5s) -- the user's
-;                             own call to make per-capture, not a fixed
-;                             design tradeoff baked in at compile time.
-;                             See the root-cause history below (Y+27/28/30)
-;                             for why this replaced ALFC specifically.
+;   Y+7 RVRS   bipolar_q23    reverse-capture probability (2026-11-03,
+;                             replaces the short-lived live DECM knob --
+;                             see below). -max=ALWAYS reverse this trig's
+;                             capture, +max=NEVER reverse, 0=50/50; every
+;                             value between is the probability of
+;                             reversing. Decided once per trig from a
+;                             24-bit LCG (RNG_STATE, Y+28) against
+;                             p_reverse=(1-RVRS)/2.
+;
+; DECIM (capture/playback decimation) was BRIEFLY a live 7th knob
+; (2026-11-03) but had a real bug: the interpolation ramp's divide-by-
+; DECIM shift never actually got switched from its old hardcoded
+; immediate to the register-sourced form the derivation implied -- so
+; any DECIM above 8 made the ramp overshoot its target every sample and
+; never settle (a runaway staircase, "portal to hell" on knob values
+; above ~64). Rather than fix-and-reverify the live knob, DECIM is back
+; to being a plain compile-time .equ (below) -- edit it in source and
+; rebuild for longer/lower-fi captures; there's no live knob for it
+; anymore. This frees the slot RVRS now occupies.
 ;
 ; TONE (a capture-time highpass, built for an earlier/separate hardware
 ; report of low-frequency screech) and ALFC (a capture-time lowpass,
 ; built to fight decimation aliasing) were REMOVED 2026-11-03, freeing
-; this file's 7th and 8th (last) parameter slots and ~831 cycles/block of
-; budget. ALFC's whole premise turned out to be unfixable by filtering:
-; a kick's pitch-envelope sweep crosses the decimation Nyquist on every
-; hit, and no FIXED filter cutoff can suppress a sweep at the instant
-; it's crossing, confirmed directly via spectrogram (ghost copies of the
-; kick's own sweep shape, tracking it) before this change. DECIM itself
-; -- raising the Nyquist directly -- is the real fix; ALFC is redundant
-; once that's live-adjustable. TONE still worked correctly for its own
+; this file's 7th and 8th (last) parameter slots. ALFC's whole premise
+; turned out to be unfixable by filtering: a kick's pitch-envelope sweep
+; crosses the decimation Nyquist on every hit, and no FIXED filter
+; cutoff can suppress a sweep at the instant it's crossing, confirmed
+; directly via spectrogram (ghost copies of the kick's own sweep shape,
+; tracking it) before this change. DECIM itself -- raising the Nyquist
+; directly -- is the real fix. TONE still worked correctly for its own
 ; original problem but wasn't needed for this one, and the user chose to
 ; trade it for budget/slot headroom rather than keep it. Y+8 (ALFC's old
 ; slot) is left genuinely unused, not repurposed for anything yet.
+;
+; CAPTURE now also layers in whatever bounce repeats are still ringing
+; from a PREVIOUS trig (2026-11-03): instead of storing the raw dry NBAL
+; blend alone, CAP_STORE sums dry + the currently-ramping HELD_WET and
+; clamps back into range (see CAP_STORE below). When nothing is ringing
+; this is a no-op (HELD_WET~=0); when a new trig lands on top of a still-
+; audible train, the new capture builds on it instead of starting clean.
 ;
 ; Persistent state (Y, relative to r6; all free words past the 6 params):
 ;   Y+9  TRACKMEM_BASE   this track's TRACK_BUFFERS base word address
@@ -81,29 +87,23 @@
 ;   Y+26 INTERP_STEP     per-sample increment ramping HELD_WET toward the
 ;                        latest target over DECIM samples -- smooths both
 ;                        ordinary decimation steps and pass-restart jumps
-;   Y+27 DECIM_CUR       this trig's actual decimation multiplier (1, 2, 4,
-;                        8, 16, 32, 64, or 128), derived once from the
-;                        DECIM knob (Y+7) and latched for the trig's whole
-;                        lifetime -- same once-per-trig-not-per-block
-;                        precedent as GATE/RATE/BEND's own derived state,
-;                        not re-read live like DCAY. Replaces the old
-;                        fixed-at-compile-time ANTIALIAS_LPF filter state
-;                        this word used to hold (removed along with ALFC,
-;                        2026-11-03 -- root cause of the aliasing problem
-;                        ALFC was built to fight: a kick's pitch-envelope
-;                        sweep crosses the decimation Nyquist on every
-;                        hit, and no FIXED filter cutoff can suppress a
-;                        sweep at the instant it's crossing, confirmed via
-;                        spectrogram -- ghost copies of the kick's own
-;                        sweep shape, tracking it. Raising the Nyquist via
-;                        DECIM is the real, direct fix; a user-adjustable
-;                        DECIM supersedes ALFC's whole premise).
-;   Y+28 DECIM_M1_CUR    DECIM_CUR-1, for seeding CAP_DECIM_CTR/
-;                        BOUNCE_DECIM_CTR's countdowns. Replaces the old
-;                        ANTIALIAS_LPF2 filter state (removed with ALFC).
+;   Y+27 REVERSE_FLAG    this trig's reverse-capture decision (0=forward,
+;                        1=reverse), drawn once per trig from RNG_STATE
+;                        against RVRS's derived probability and latched
+;                        for the trig's whole capture. Replaces the
+;                        short-lived DECIM_CUR word (the live DECM knob
+;                        was dropped 2026-11-03 -- see the RVRS/DECIM
+;                        header comments above), which itself had
+;                        replaced the original ANTIALIAS_LPF filter state.
+;   Y+28 RNG_STATE       24-bit LCG state driving REVERSE_FLAG's draw.
+;                        Advanced once per trig, NEVER reset (including
+;                        across IDLE stretches) so consecutive trigs don't
+;                        repeat the same draw. Replaces the short-lived
+;                        DECIM_M1_CUR word, which itself had replaced the
+;                        original ANTIALIAS_LPF2 filter state.
 ;   Y+29 CAP_WINDOW_REMAIN real samples left in the fixed capture window,
-;                        counted DOWN from WINDOW_SAMPLES_CUR every sample
-;                        regardless of GATE (a countdown is one
+;                        counted DOWN from WINDOW_SAMPLES (the .equ) every
+;                        sample regardless of GATE (a countdown is one
 ;                        instruction cheaper per sample than counting up
 ;                        and comparing against a constant). Once this
 ;                        reaches zero, capture simply stops storing for
@@ -115,25 +115,28 @@
 ;                        this word's own countdown is itself independent
 ;                        of GATE too, always running the full fixed
 ;                        duration regardless.
-;   Y+30 WINDOW_SAMPLES_CUR this trig's actual capture-window duration in
-;                        real samples (BUFLEN*DECIM_CUR), derived once at
-;                        trig time since DECIM is no longer a compile-time
-;                        constant. Replaces TONE's old HPF_LPF_STATE
-;                        tracker (removed with TONE, 2026-11-03).
-;   Y+31 SHIFT_EXP_CUR   the DECIM knob's bucketed exponent (0..7, so
-;                        DECIM_CUR = 1<<SHIFT_EXP_CUR), latched alongside
-;                        DECIM_CUR at trig time. Feeds the interpolation
-;                        step's divide-by-DECIM shift directly (register-
-;                        sourced "asr x0,a,a", confirmed working on the
-;                        real toolchain via dsp56300/cyclecheck/sign_test/
-;                        shift_var_test.asm56k before this was relied on --
-;                        both ASR and ASL accept a register-sourced shift
-;                        count on this hardware, same 1-cycle cost as the
-;                        old hardcoded immediate form it replaces).
+;   Y+30 PREV_WET_SNAPSHOT a one-time copy of HELD_WET taken at the
+;                        instant a fresh trig lands (before HELD_WET
+;                        itself gets zeroed for BOUNCE's own output
+;                        correctness -- see the RATE/trig-reset block),
+;                        so CAP_STORE can still layer "whatever was
+;                        ringing from the previous trig" into the new
+;                        capture even though HELD_WET itself no longer
+;                        holds that value by the time capture runs.
+;                        Fixed for the whole capture, not resampled
+;                        live. Found necessary via probe_rvrs.cpp's
+;                        functional check (2026-11-03) -- reading live
+;                        HELD_WET directly would always see 0, since the
+;                        zeroing happens first. Reclaims the slot that
+;                        held WINDOW_SAMPLES_CUR during the short-lived
+;                        live-DECIM-knob round.
+;   Y+31/32 free -- held SHIFT_EXP_CUR/GAP_FLOOR_CUR during the same
+;                        short-lived round; reclaimed 2026-11-03 along
+;                        with it. Not repurposed for anything yet.
 ;
 ; BITS is deliberately not implemented in v1 (shelved per the user). TONE
 ; and ALFC were both implemented at various points but removed 2026-11-03
-; (see the Y+7 DECIM comment above for the full reasoning).
+; (see the Y+7 RVRS/DECIM comments above for the full reasoning).
 ;
 ; Fixed-point notes (empirically verified this session against the real
 ; dsp56300 interpreter, not assumed -- see dsp56300/cyclecheck/probe_mpy.cpp):
@@ -149,10 +152,18 @@
 
 
 .equ BUFLEN 1536 ; TRACK_BUFFERS words/track
-; DECIM, DECIM_M1 and WINDOW_SAMPLES are no longer compile-time constants
-; here -- DECIM is now a live knob (Y+7), derived once per trig into
-; DECIM_CUR/DECIM_M1_CUR/WINDOW_SAMPLES_CUR (Y+27/28/30), see the header
-; comment block above. Removed 2026-11-03 along with ALFC.
+.equ DECIM 4 ; real samples skipped per stored word. RAISE this for
+             ; longer, more lo-fi captures (e.g. 8=~70ms, 16=~140ms);
+             ; LOWER for shorter/cleaner ones. Rebuild after editing.
+             ; MUST keep DECIM_SHIFT below in sync by hand -- this
+             ; project's assembler has no log2(). (Back to a plain
+             ; compile-time constant 2026-11-03; briefly a live knob,
+             ; dropped after a real bug in its interpolation-shift
+             ; derivation -- see the RVRS/DECIM header comments above.)
+.equ DECIM_SHIFT 2 ; = log2(DECIM). DECIM=1->0, 2->1, 4->2, 8->3, 16->4,
+                   ; 32->5, 64->6, 128->7.
+.equ DECIM_M1 3 ; = DECIM-1
+.equ WINDOW_SAMPLES 6144 ; = BUFLEN*DECIM
 .equ GAP_FLOOR 8 ; provisional -- re-measure cycle cost before trusting
 .equ GAP_CEIL 220500 ; 5 seconds -- raised from the original 1-second
                      ; default, which was clamping BEND's grow/decelerate
@@ -225,9 +236,17 @@ TRACKMEM:
         move a,y:(r6+$19)
         move a,y:(r6+$1a)
         move a,y:(r6+$1b)
-        move a,y:(r6+$1c)
         move a,y:(r6+$1d)
         move a,y:(r6+$1e)
+        ; RNG_STATE (Y+28/$1c) must NOT be zero -- a Galois LFSR seeded
+        ; at 0 is a fixed point (lsl(0)=0, carry always 0, so eor never
+        ; fires: it would stay 0 forever, making RVRS's draw silently
+        ; deterministic on every track forever). Caught before shipping
+        ; via probe_rvrs.cpp's 50/50 sanity check. Same arbitrary nonzero
+        ; seed pluck.asm56k itself uses for the identical idiom (its own
+        ; comment: "any nonzero noise state").
+        move #>$5a5a5a,x0
+        move x0,y:(r6+$1c)
         rts
 
 TRIG:
@@ -246,51 +265,122 @@ RENDER:
         clr a
         move a,y:(r6+$b)
 
-        ; --- DECIM: bucket the raw knob<<16 value into one of 8 zones via
-        ; a single fixed shift (raw>>20), then derive DECIM_CUR/
-        ; DECIM_M1_CUR/WINDOW_SAMPLES_CUR from it -- all latched once per
-        ; trig (not re-read every block, same precedent as GATE/RATE/BEND
-        ; below), since DECIM is no longer a compile-time constant. Must
-        ; run before GATE's own code just below, which already needs
-        ; DECIM_CUR. x0/x1/y0/y1/a/b are all free scratch here -- this is
-        ; the once-per-trig preamble, before RENDER_LOOP's per-sample body
-        ; where x1 becomes reserved for the dry sample.
-        move y:(r6+$7),a ; DECIM param, raw unipolar_q23 (knob<<16)
-        asr #$14,a,a ; a1 = exponent 0..7 (raw>>20, hex 14 = decimal 20)
-        ; defensive clamp -- MDX spec: "Modulation can produce in-between
-        ; settings", so an LFO-modulated value isn't guaranteed to land
-        ; cleanly in [0,7] even though a plain knob turn always will.
-        tst a
-        bge <DECIM_EXP_NONNEG
-        clr a
-DECIM_EXP_NONNEG:
-        cmp #>7,a
-        ble <DECIM_EXP_OK
-        move #>7,a
-DECIM_EXP_OK:
-        move a1,y:(r6+$1f) ; SHIFT_EXP_CUR
-        move a1,x0 ; x0 = exponent, for the register-sourced ASL below
+        ; --- RVRS: decide this trig's REVERSE_FLAG once, before GATE's
+        ; own code just below (which needs to know CAP_REMAIN's final
+        ; value before it can set CAP_POS's starting point -- that part
+        ; happens in GATE_DONE, not here; here we only decide the
+        ; direction). x0/x1/y0/y1/a/b are all free scratch here, same
+        ; once-per-trig preamble spot the old DECIM derivation used to
+        ; occupy.
+        ;
+        ; RVRS is bipolar_q23: -max=ALWAYS reverse, +max=NEVER reverse,
+        ; 0=50/50, every value between is the probability. Special-case
+        ; both exact extremes (same discipline as GATE/BEND's own
+        ; $800000 edge case and MIX's knob=127 snap elsewhere in this
+        ; file) so "always"/"never" are exact, not merely "almost
+        ; certain" -- skips the RNG draw entirely in both cases.
+        move y:(r6+$7),x0 ; RVRS param, raw bipolar_q23
+        move x0,a
+        cmp #>$800000,a
+        beq <RVRS_ALWAYS
+        ; bipolar_q23's own knob=127-short-of-true-ceiling value is
+        ; $7e0000, NOT $7f0000 (that's unipolar's different knob<<16
+        ; shortfall, e.g. MIX elsewhere in this file) -- bipolar's raw
+        ; encoding is (knob-64)<<17 per the MDS spec ("0 becomes -1, 64
+        ; becomes zero"), so knob=127 -> 63<<17 = $7e0000.
+        cmp #>$7e0000,a
+        bge <RVRS_NEVER
+
+        ; general case: p_reverse = (1-RVRS)/2. (1-RVRS) can reach 2.0
+        ; for RVRS near -1, unrepresentable directly in Q23 -- same
+        ; "subtract in the full accumulator first, shift/scale once at
+        ; the end" pattern already proven elsewhere in this file (the
+        ; interpolation-step and anti-alias-filter fixes) rather than
+        ; risking a truncated intermediate.
+        move #>$7fffff,a
+        sub x0,a ; a = 1-RVRS, full accumulator, up to 2.0 -- not yet
+                 ; truncated, so this cannot overflow
+        asr a ; a = (1-RVRS)/2, now safely in [0,1] -- single truncation
+        move a1,y0 ; y0 = p_reverse, stashed across the LFSR mix below
+                   ; (which only touches a/b/x1) so it survives untouched
+        bra <RVRS_DRAW
+RVRS_ALWAYS:
         move #>1,a
-        asl x0,a,a ; a1 = DECIM_CUR = 1<<exponent -- register-sourced
-                   ; shift, confirmed working on the real toolchain via
-                   ; dsp56300/cyclecheck/sign_test/shift_var_test.asm56k
-                   ; before this was relied on (both ASR and ASL accept a
-                   ; register-sourced shift count on this hardware, same
-                   ; 1-cycle cost as the old hardcoded immediate form)
-        move a1,y:(r6+$1b) ; DECIM_CUR
-        move a1,y1 ; y1 = DECIM_CUR, kept for the mpy below (mpy needs an
-                   ; x0/x1/y0/y1 source, never a0/a1 directly)
-        move #>1,x0
-        sub x0,a ; a = DECIM_CUR - 1
-        move a1,y:(r6+$1c) ; DECIM_M1_CUR
-        move #>BUFLEN,x0
-        mpy y1,x0,a ; plain integer * plain integer -- small, needs the
-                    ; doubled-product undo (same idiom as TRACKMEM_BASE's
-                    ; own setup in INIT, see refs/GOLD_STANDARD.md
-                    ; section 3)
-        asr a
-        move a0,a
-        move a1,y:(r6+$1e) ; WINDOW_SAMPLES_CUR
+        move a1,y:(r6+$1b) ; REVERSE_FLAG=1, skip the RNG draw entirely
+        bra <RVRS_DONE
+RVRS_NEVER:
+        clr a
+        move a1,y:(r6+$1b) ; REVERSE_FLAG=0
+        bra <RVRS_DONE
+RVRS_DRAW:
+        ; advance RNG_STATE via a Galois LFSR (taps x^24+x^23+x^22+x^17+1,
+        ; $c20001) -- the shift/eor idiom itself is MDS's own official
+        ; example machine's noise generator (MDS/machines/examples/
+        ; imports/pluck.asm56k, "a 24-bit shift-register noise source"),
+        ; reused rather than inventing a new RNG. UNROLLED by hand here,
+        ; NOT wrapped in a hardware "do" loop like pluck.asm56k's own
+        ; usage: measured directly via the cycle-check harness, a
+        ; hardware do-loop around this exact lsl/bcc/eor body (8
+        ; iterations) cost ~4600 EXTRA cycles here -- confirmed via
+        ; isolated A/B scenarios (skipping the loop entirely cost the
+        ; same as a normal fresh trig; running it cost +4600) -- while
+        ; the identical shape ran correctly and cheaply as a standalone
+        ; probe (dsp56300/cyclecheck/sign_test/lfsr_test3.asm56k). That
+        ; points at a loop-counting hazard specific to a conditional
+        ; branch inside a hardware do-loop on this toolchain/emulator
+        ; (possibly latent in pluck.asm56k too, just inaudible there) --
+        ; rather than chase that further, sidestepping it entirely by
+        ; unrolling, the SAME plain-branch construct already proven safe
+        ; everywhere else in this file.
+        move y:(r6+$1c),b ; RNG_STATE
+        move #>$c20001,x1
+        lsl b
+        bcc <RVRS_MIX1_KEEP
+        eor x1,b
+RVRS_MIX1_KEEP:
+        lsl b
+        bcc <RVRS_MIX2_KEEP
+        eor x1,b
+RVRS_MIX2_KEEP:
+        lsl b
+        bcc <RVRS_MIX3_KEEP
+        eor x1,b
+RVRS_MIX3_KEEP:
+        lsl b
+        bcc <RVRS_MIX4_KEEP
+        eor x1,b
+RVRS_MIX4_KEEP:
+        lsl b
+        bcc <RVRS_MIX5_KEEP
+        eor x1,b
+RVRS_MIX5_KEEP:
+        lsl b
+        bcc <RVRS_MIX6_KEEP
+        eor x1,b
+RVRS_MIX6_KEEP:
+        lsl b
+        bcc <RVRS_MIX7_KEEP
+        eor x1,b
+RVRS_MIX7_KEEP:
+        lsl b
+        bcc <RVRS_MIX8_KEEP
+        eor x1,b
+RVRS_MIX8_KEEP:
+        move b1,y:(r6+$1c) ; store the advanced RNG_STATE
+        move b1,a
+        and #>$7fffff,a ; fold into a unipolar fraction in [0,~1) --
+                        ; discards only the sign bit, no negation needed
+        move a1,x0 ; x0 = rng_fraction
+        move y0,a ; a = p_reverse (stashed above)
+        cmp x0,a
+        bgt <RVRS_FLAG_SET ; rng_fraction < p_reverse -> reverse
+        clr a
+        move a1,y:(r6+$1b) ; REVERSE_FLAG=0
+        bra <RVRS_DONE
+RVRS_FLAG_SET:
+        move #>1,a
+        move a1,y:(r6+$1b) ; REVERSE_FLAG=1
+RVRS_DONE:
 
         ; GATE shapes the capture window (see DESIGN.md section 7): both
         ; directions reduce to the same "missing = BUFLEN*|g|" magnitude;
@@ -352,19 +442,39 @@ GATE_POS:
         move a1,y:(r6+$10)
         move x1,y1 ; y1 = missing words (mpy needs an
                                          ; x0/x1/y0/y1 source, never a0/a1)
-        move y:(r6+$1b),x0 ; DECIM_CUR (derived above, no longer a .equ)
+        move #>DECIM,x0
         mpy y1,x0,a ; plain int * plain int -- small
         asr a
         move a0,a ; relocate into a1
         move a1,y:(r6+$f)
 GATE_DONE:
+        ; CAP_POS's starting point depends on REVERSE_FLAG (decided
+        ; above, in the once-per-trig RVRS preamble): forward captures
+        ; start at word 0 and count up as always; reversed captures
+        ; start at the LAST word this trig will actually write
+        ; (CAP_REMAIN-1, already final by this point) and count down,
+        ; so BOUNCE -- which always reads forward from buffer[0]
+        ; unchanged -- plays the captured content back reversed with no
+        ; changes to playback logic at all.
+        move y:(r6+$1b),a ; REVERSE_FLAG
+        tst a
+        bne <GATE_CAPPOS_REV
         clr a
-        move a,y:(r6+$c)
-        move y:(r6+$1e),x0 ; WINDOW_SAMPLES_CUR (derived above)
-        move x0,y:(r6+$1d) ; CAP_WINDOW_REMAIN = WINDOW_SAMPLES_CUR (counts
+        move a,y:(r6+$c) ; forward: CAP_POS=0
+        bra <GATE_CAPPOS_DONE
+GATE_CAPPOS_REV:
+        move y:(r6+$d),a ; CAP_REMAIN, final value as of just above
+        sub #>1,a
+        move a1,y:(r6+$c) ; reverse: CAP_POS=CAP_REMAIN-1 (if CAP_REMAIN
+                          ; is 0, this is never dereferenced -- CAP_STORE
+                          ; is already gated on CAP_REMAIN>0 regardless
+                          ; of direction)
+GATE_CAPPOS_DONE:
+        move #>WINDOW_SAMPLES,x0
+        move x0,y:(r6+$1d) ; CAP_WINDOW_REMAIN = WINDOW_SAMPLES (counts
                            ; down, not up -- cheaper per-sample check,
                            ; see below)
-        move y:(r6+$1c),x0 ; DECIM_M1_CUR (derived above)
+        move #>DECIM_M1,x0
         move x0,y:(r6+$e)
         move #>1,a
         move a,y:(r6+$a) ; PHASE = ACTIVE (capture and bounce now run
@@ -390,6 +500,23 @@ GATE_DONE:
         add x0,a
         move a1,y:(r6+$14)
         move a1,y:(r6+$13)
+
+        ; snapshot whatever HELD_WET is ringing right NOW, before it gets
+        ; zeroed just below -- CAP_STORE reads this snapshot (not live
+        ; HELD_WET) for the layered-capture blend. HELD_WET itself still
+        ; needs to be zeroed here regardless (see the comment on that
+        ; line): it also feeds BOUNCE's own audible output ramp, and a
+        ; fresh trig must NOT leak the old train's amplitude into the new
+        ; one's first streamed samples. These are two different
+        ; consumers of "what was ringing" with different needs -- a
+        ; single live word can't serve both once the old train is being
+        ; cancelled for one purpose but captured for the other. This
+        ; snapshot is a one-time value for the whole capture (not
+        ; resampled live), matching the brief's own framing: a blend
+        ; taken at the moment of the new trig, not a continuously-varying
+        ; sum.
+        move y:(r6+$19),x0
+        move x0,y:(r6+$1e) ; PREV_WET_SNAPSHOT
         clr a
         move a,y:(r6+$11) ; BOUNCE_POS=0
         move a,y:(r6+$12) ; BOUNCE_DECIM_CTR=0
@@ -541,15 +668,15 @@ RENDER_LOOP:
 
         ; (The anti-alias LPF cascade and TONE's highpass used to run
         ; here, every real sample while capturing -- removed 2026-11-03.
-        ; The real fix for decimation aliasing turned out to be the DECIM
-        ; knob itself [raising the Nyquist directly], not filtering before
-        ; capture: a kick's pitch-envelope sweep crosses whatever Nyquist
-        ; is in effect on every hit, and no FIXED filter cutoff can
-        ; suppress a sweep at the exact instant it's crossing, confirmed
-        ; via spectrogram before this change. CAP_STORE below now stores
-        ; the raw dry sample [x1] directly -- no filtered copy exists
-        ; anymore, Y+27/28/30 are DECIM_CUR/DECIM_M1_CUR/
-        ; WINDOW_SAMPLES_CUR instead of filter state.)
+        ; The real fix for decimation aliasing turned out to be DECIM
+        ; itself [raising the Nyquist directly, now a fixed compile-time
+        ; value -- see the .equ above], not filtering before capture: a
+        ; kick's pitch-envelope sweep crosses whatever Nyquist is in
+        ; effect on every hit, and no FIXED filter cutoff can suppress a
+        ; sweep at the exact instant it's crossing, confirmed via
+        ; spectrogram before this change. CAP_STORE below now stores
+        ; dry layered with whatever bounce is still ringing from a
+        ; PREVIOUS trig, not a filtered copy -- see CAP_STORE itself.)
 
         move y:(r6+$f),a
         tst a
@@ -573,14 +700,60 @@ CAP_ACTIVE:
         move a1,y:(r6+$e)
         bra <SKIP_CAPTURE
 CAP_STORE:
-        move y:(r6+$1c),a ; DECIM_M1_CUR (derived once per trig above)
+        move #>DECIM_M1,a
         move a1,y:(r6+$e)
-        move y:(r6+$c),a
+
+        ; layered capture: sum dry(x1) + whatever bounce was still
+        ; ringing from a PREVIOUS trig, in the full accumulator (bounded
+        ; to +/-2.0, cannot wrap) then clamp back into Q23 range before
+        ; storing. When nothing was ringing (snapshot~=0) this reduces
+        ; to plain x1 -- today's unchanged level, not an attenuated
+        ; blend (a fixed-ratio convex combination was considered and
+        ; rejected: it would halve the captured level whenever nothing
+        ; is ringing, the common case).
+        ;
+        ; Reads PREV_WET_SNAPSHOT (Y+30), NOT live HELD_WET (Y+25) --
+        ; found via probe_rvrs.cpp's functional check, a real bug caught
+        ; before shipping: a fresh trig unconditionally zeroes HELD_WET
+        ; (see the RATE/trig-reset block above) so BOUNCE's own audible
+        ; output doesn't inherit the OLD train's stale amplitude. Reading
+        ; HELD_WET itself here would therefore see 0 for the first store
+        ; after every single trig -- the one-time snapshot taken right
+        ; before that zeroing is what actually carries "whatever was
+        ; ringing" into this capture; it's deliberately a fixed value for
+        ; the whole capture, not resampled live sample-to-sample.
+        move y:(r6+$1e),x0 ; PREV_WET_SNAPSHOT
+        move x1,a
+        add x0,a ; + PREV_WET_SNAPSHOT
+        cmp #>$7fffff,a
+        ble <CAPSTORE_CLAMP_LO
+        move #>$7fffff,a
+CAPSTORE_CLAMP_LO:
+        cmp #>$800000,a
+        bge <CAPSTORE_CLAMPED
+        move #>$800000,a
+CAPSTORE_CLAMPED:
+        move a1,y1 ; y1 = blended, clamped sample to store
+
+        move y:(r6+$c),a ; CAP_POS
         move a1,n3
-        move x1,y:(r3+n3) ; raw dry sample, no anti-alias filter anymore
-                          ; (TONE/ALFC removed 2026-11-03 -- the real fix
-                          ; for aliasing is the DECIM knob, not filtering)
+        move a1,x0 ; x0 = CAP_POS, kept for the direction update below
+        move y1,y:(r3+n3) ; store
+
+        ; direction depends on REVERSE_FLAG (decided once per trig;
+        ; GATE_DONE already set CAP_POS's starting point to match)
+        move y:(r6+$1b),a ; REVERSE_FLAG
+        tst a
+        move x0,a ; a = CAP_POS again -- plain "move" doesn't touch the
+                  ; condition codes on this hardware (proven via
+                  ; move_flags_test.asm56k), so tst's flags above are
+                  ; still valid at the branch just below
+        bne <CAPSTORE_REV
         add #>1,a
+        bra <CAPSTORE_POS_DONE
+CAPSTORE_REV:
+        sub #>1,a
+CAPSTORE_POS_DONE:
         move a1,y:(r6+$c)
         move y:(r6+$d),a
         sub #>1,a
@@ -734,7 +907,7 @@ BOUNCE_BEGIN_PASS:
         move y:(r6+$10),a
         move a1,y1 ; y1 = CAP_LEN_FINAL (mpy needs an
                                          ; x0/x1/y0/y1 source, never a0/a1)
-        move y:(r6+$1b),x0 ; DECIM_CUR (derived once per trig above)
+        move #>DECIM,x0
         mpy y1,x0,a ; plain int * plain int -- small
         asr a
         move a0,a ; relocate into a1
@@ -773,7 +946,7 @@ GAP_KEEP:
         move a1,y:(r6+$12)
         bra <SKIP_BOUNCE
 BOUNCE_ADVANCE:
-        move y:(r6+$1c),a ; DECIM_M1_CUR (derived once per trig above)
+        move #>DECIM_M1,a
         move a1,y:(r6+$12)
         move y:(r6+$11),a
         move a1,n3
@@ -832,12 +1005,20 @@ BOUNCE_ADVANCE_DONE:
         move y:(r6+$19),x0 ; x0 = HELD_WET (current)
         sub x0,a ; a = target - current, full accumulator -- exact even
                  ; past +/-1.0, same proof as the HPF/anti-alias subtracts
-        asr #$3,a,a ; a = (target-current)/8, single truncation, from the
-                    ; full-precision difference -- shift amount matches
-                    ; DECIM (now 8, was 16/shift-by-4): the ramp must
-                    ; reach the new target in exactly DECIM hold-samples,
-                    ; so this HAS to track DECIM's own value, not be
-                    ; independently chosen
+        ; shift amount MUST track DECIM_SHIFT (=log2(DECIM)) -- the ramp
+        ; has to reach the new target in exactly DECIM hold-samples. This
+        ; immediate was briefly fed by a register-sourced SHIFT_EXP_CUR
+        ; during the short-lived live-DECIM-knob round and never got
+        ; updated to match it at this exact site -- any DECIM above 8
+        ; made the step several times too large, so HELD_WET overshot
+        ; its target every sample and never settled (the "portal to
+        ; hell" reported for high knob values). Back to a plain
+        ; compile-time immediate now that DECIM is fixed per build --
+        ; if you edit DECIM above, you MUST update DECIM_SHIFT (and this
+        ; instruction) to match, by hand.
+        asr #DECIM_SHIFT,a,a ; a = (target-current)/DECIM, single
+                             ; truncation, from the full-precision
+                             ; difference
         move a1,y:(r6+$1a) ; new INTERP_STEP, ramps toward target over the
                            ; next DECIM_M1 hold-samples
         move y:(r6+$11),a

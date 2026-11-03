@@ -1,18 +1,20 @@
 # NFX-BO v1 — Design (from BRIEF.md + GOLD_STANDARD.md, from scratch)
 
-Status, 2026-10-31 (round 8, RATE/BEND timing redesign): **implemented,
-assembled, packed, and cycle-checked**. `NFXBO.asm56k`/`NFXBO.json` build
-cleanly to `NFXBO.mds` → `NFX-BO.syx` (403 program words, 1 import,
-structurally validated via `mds_validate.js`, worst-case measured at
-3867/3951 cycles — see TODO.md "Round 8 fixes" for the full list of what
-changed this round and why; capture and bounce now run CONCURRENTLY
-rather than as mutually-exclusive phases, see Y+10 PHASE in
-NFXBO.asm56k's header comment). **Not yet tested on real hardware** — nothing
-below should be treated as confirmed-working until a real flash-and-listen
-pass happens; this design doc originally pinned down terminology/structure
-before any code was written (lesson learned the hard way on the previous
-attempt — see `../bounce-delay/`), and is kept below as the record of that
-reasoning, now with later sections appended as decisions were resolved.
+Status, 2026-11-03 (round 12): **implemented, assembled, packed, and
+cycle-checked**. `NFXBO.asm56k`/`NFXBO.json` build cleanly to
+`NFXBO.mds` → `NFX-BO.syx` (453 program words, 1 import, structurally
+validated via `mds_validate.js`, worst-case measured at 3267/3951
+cycles). v1 now ships 7 knobs (NBAL/GATE/RATE/BEND/DCAY/MIX/RVRS, not the
+6 this doc was originally written for — TONE/BITS/ALFC were all tried
+and dropped again at various points; RVRS and a layered-capture change
+were added round 12; see TODO.md for the full history). **This specific
+build has not yet been tested on real hardware** — this design doc
+originally pinned down terminology/structure before any code was written
+(lesson learned the hard way on the previous attempt — see
+`../bounce-delay/`), and is kept below as the record of that original
+reasoning. It is NOT kept in sync with every later round — `TODO.md` is
+the authoritative current-state record; treat anything below that
+conflicts with it as historical context, not current spec.
 
 **v1 originally shipped with six active knobs — NBAL, GATE, RATE, BEND,
 DCAY, MIX.** TONE and BITS were shelved for the initial build ("the least
