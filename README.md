@@ -12,6 +12,11 @@ it does, its parameters, build/install instructions, and status.
 - [`NFX-BO/`](NFX-BO/) — a bouncing-ball delay: captures a short, decimated
   blend of the two tracks before it on each trig, then plays it back as a
   series of discrete, decaying, bouncing echoes. In active development.
+- [`NFX-UW/`](NFX-UW/) — a self-sampling overdub/freeze machine: each trig
+  plays its own capture buffer through once, optionally blending a fresh
+  live capture back in (REC) instead of a decaying repeat train. Built from
+  NFX-BO's patterns; 12-bit sample packing doubles its capture length. In
+  active development.
 
 ## `refs/`
 

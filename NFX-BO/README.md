@@ -11,8 +11,9 @@ technical design (parameter transforms, memory layout, state machine).
 v1 ships 7 parameters — **NBAL, GATE, RATE, BEND, DCAY, MIX, RVRS**
 (reverse-capture probability) — implemented, assembled, packed, and
 cycle-checked (worst case 3267/3951 cycles). **Hardware testing is in
-progress**; see `TODO.md` for the current round of fixes and what's still
-unverified by ear.
+progress**; see `TODO.md` (kept at `_authoring\resource\`, not alongside
+this file) for the current round of fixes and what's still unverified by
+ear.
 
 TONE and ALFC (anti-aliasing filter knobs explored mid-project) were tried
 and removed — the real fix for decimation aliasing turned out to be
@@ -54,7 +55,10 @@ starting from a clean slate. No knob for this; it's always on.
 - `NFXBO.json` — machine manifest (parameters, transforms, memory/import declarations)
 - `NFXBO.lod` / `NFXBO.mds` / `NFX-BO.syx` — build outputs (see Build below)
 - `NFXBO.symbols.json` — label/address table from the assembler
-- `TODO.md` — open items and hardware-test history
+
+Open items and hardware-test history (`TODO.md`), plus test recordings
+and reference images, now live in `_authoring\resource\`, not in this
+folder.
 
 ## Build toolchain (external — not included in this repo)
 
