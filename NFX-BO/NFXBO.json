@@ -1,7 +1,7 @@
 {
   "id": "org.mathsmechanic.nfxbo",
   "display_name": "NFX-BO",
-  "description": "trig-gated, discretely-repeating bouncing-ball delay on a blend of the two tracks before (v1, from-scratch rebuild)",
+  "description": "trig-gated, discretely-repeating bouncing-ball delay on a blend of the two tracks before, 12-bit packed for doubled capture length (promoted 2026-11-09, retiring an earlier 24-bit build of the same behavior)",
   "category": "NFX",
   "short_label": "BO",
   "neighbour": true,
@@ -15,7 +15,7 @@
     { "name": "RVRS", "default": 127, "transform": "bipolar_q23" }
   ],
   "program": {
-    "y_workset_words": 30,
+    "y_workset_words": 32,
     "relocations": [
       "RENDER_LOOP"
     ],

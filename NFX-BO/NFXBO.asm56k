@@ -1,5 +1,10 @@
-; NFX-BO v1 -- bouncing-ball delay on the blend of the two tracks before.
-; Ground-up rebuild, 2026-10-29. See BRIEF.md / DESIGN.md for the spec.
+; NFX-BO v1 -- 12-bit packed backport of NFX-BO (bouncing-ball delay on
+; the blend of the two tracks before), doubling capture length for the
+; same DECIM. Rebuilt 2026-11-06 from NFX-BO's own current, certifier-
+; audited build (see BRIEF.md / DESIGN.md for the spec, and DESIGN.md
+; Sec 14/15 for this rebuild's own history -- a first attempt at this
+; backport was shelved for being far over the real MDS 1.1 cycle
+; ceiling; this is a fresh backport, not a resurrection of that file).
 ;
 ; Parameter block (Y, relative to r6):
 ;   Y+1 NBAL   unipolar_q23   neighbour blend: 0=two back(far) 1=one back(near)
@@ -69,12 +74,20 @@
 ;                        ahead for the rest of the window; bounce can
 ;                        never read past what's actually been captured.)
 ;   Y+11 TRIG_FLAG       set by TRIG, consumed once by RENDER
-;   Y+12 CAP_POS         capture write offset, 0..CAP_LEN_FINAL-1
-;   Y+13 CAP_REMAIN      decimated words still to capture (countdown)
-;   Y+14 CAP_DECIM_CTR   real-sample countdown between stored capture words
+;   Y+12 CAP_POS         capture write offset, 0..CAP_LEN_FINAL-1, in
+;                        LOGICAL units (12-bit packing -- word-index =
+;                        CAP_POS>>1, sub-phase = CAP_POS&1; see
+;                        CAP_STORE below)
+;   Y+13 CAP_REMAIN      decimated LOGICAL samples still to capture
+;                        (countdown)
+;   Y+14 CAP_DECIM_CTR   real-sample countdown between stored capture
+;                        samples
 ;   Y+15 CAP_DELAY_REMAIN real samples to wait before capture starts (GATE>0)
-;   Y+16 CAP_LEN_FINAL   final captured length in words (set when capture ends)
-;   Y+17 BOUNCE_POS      current read/write offset into the captured buffer
+;   Y+16 CAP_LEN_FINAL   final captured length in LOGICAL samples (set
+;                        when capture ends)
+;   Y+17 BOUNCE_POS      current read/write offset into the captured
+;                        buffer, in LOGICAL units (same addressing as
+;                        CAP_POS above)
 ;   Y+18 BOUNCE_DECIM_CTR real-sample countdown for decimated-hold playback
 ;   Y+19 GAP_REMAIN      real samples until the next repeat restarts
 ;   Y+20 GAP_CUR         current inter-repeat gap, in real samples
@@ -130,13 +143,69 @@
 ;                        zeroing happens first. Reclaims the slot that
 ;                        held WINDOW_SAMPLES_CUR during the short-lived
 ;                        live-DECIM-knob round.
-;   Y+31/32 free -- held SHIFT_EXP_CUR/GAP_FLOOR_CUR during the same
-;                        short-lived round; reclaimed 2026-11-03 along
-;                        with it. Not repurposed for anything yet.
+;   Y+31 PENDING_HALF    12-bit packing (reused slot -- was free in the
+;                        24-bit NFX-BO this was rebuilt from). On a
+;                        CAP_STORE event whose LOGICAL position is the
+;                        FIRST of its word-pair, the quantized half is
+;                        stashed here (not written to memory yet); on
+;                        the matching second event, it's combined with
+;                        that event's own half and the complete word is
+;                        written in one go -- avoids any read-modify-
+;                        write on a half-complete word. Direction-aware
+;                        (see CAP_STORE below) -- same exact mechanism,
+;                        and the same reverse-specific pairing bug
+;                        class, as NUW-JT's own (already fixed there;
+;                        reused verbatim here). BOUNCE_ADVANCE does NOT
+;                        need this: it always reads a complete word
+;                        (both halves) before writing, so it can
+;                        read-modify-write in one step every time -- no
+;                        stash-and-wait needed.
+;   Y+32 free -- not repurposed for anything yet.
 ;
 ; BITS is deliberately not implemented in v1 (shelved per the user). TONE
 ; and ALFC were both implemented at various points but removed 2026-11-03
 ; (see the Y+7 RVRS/DECIM comments above for the full reasoning).
+;
+; 12-bit sample packing (REBUILT 2026-11-06, second attempt -- see
+; DESIGN.md Sec 14/15 for the full history: the first attempt, forked
+; from an earlier NFX-BO snapshot, was found to be far over the real MDS
+; 1.1 cycle ceiling and was shelved before this rebuild; this is a fresh
+; backport starting from NFX-BO's own CURRENT, already certifier-audited
+; build, not a resurrection of the shelved file). Two signed 12-bit
+; samples share one 24-bit Y-memory word, doubling effective capture
+; length -- see LOGICAL_BUFLEN's own .equ comment below for the headline
+; reasoning. A LOGICAL sample index replaces the plain word index
+; CAP_POS/BOUNCE_POS used to be: word-index = logical>>1, sub-phase =
+; logical&1 (0=top 12 bits, 1=bottom 12). Quantize via asr #12 (top 12
+; bits, already sign-extended); pack two quantized halves by masking
+; each to #$fff and shifting the first left 12 before adding; unpack a
+; half by shifting to reposition (bottom half only) then sign-extending
+; (asr #12) then rescaling back to Q23 range (asl #12, bottom 12 bits
+; now zero -- the quantization noise floor, SP-1200/S900-style
+; character, same as NUW-JT's).
+;
+; CRITICAL, confirmed via direct probe on NUW-JT (dsp56300/cyclecheck/
+; sign_test/shift12_isolate*.asm56k, pack12_test2.asm56k) BEFORE relying
+; on it there, reused as fact here too: two consecutive immediate-shift
+; instructions naming the SAME register silently merge into one NET
+; shift (asr counts negative, asl positive) regardless of what
+; unrelated instructions sit between them -- "asr #12,a,a" then
+; "asl #12,a,a" nets to a complete no-op, not two independent shifts.
+; Fix, used throughout below: alternate registers for every such pair
+; (shift on b, move b1,a, shift on a) -- never two shifts in a row
+; naming the same register.
+;
+; A characteristic this backport introduces, worth knowing about (not
+; necessarily a problem, just different from before): BOUNCE's decay-
+; and-write-back now re-quantizes to 12-bit on EVERY repeat, not just
+; once at capture time -- there's no separate full-precision "shadow"
+; copy, the packed buffer IS the only place a ringing train's value
+; lives between bounces. DCAY_MULT already shrinks the signal every
+; repeat and ACCUM_LEVEL/LEVEL_THRESHOLD already bounds how long a
+; train can ring, so this seems unlikely to be audible as anything
+; beyond "a bit more lo-fi per repeat, same spirit as the original
+; 12-bit capture already trades for" -- but it hasn't been confirmed by
+; ear.
 ;
 ; Fixed-point notes (empirically verified this session against the real
 ; dsp56300 interpreter, not assumed -- see dsp56300/cyclecheck/probe_mpy.cpp):
@@ -151,19 +220,35 @@
 ;   - mpy's source operands must be x0/x1/y0/y1 -- never a0/a1/b0/b1 directly.
 
 
-.equ BUFLEN 1536 ; TRACK_BUFFERS words/track
-.equ DECIM 4 ; real samples skipped per stored word. RAISE this for
-             ; longer, more lo-fi captures (e.g. 8=~70ms, 16=~140ms);
-             ; LOWER for shorter/cleaner ones. Rebuild after editing.
-             ; MUST keep DECIM_SHIFT below in sync by hand -- this
-             ; project's assembler has no log2(). (Back to a plain
-             ; compile-time constant 2026-11-03; briefly a live knob,
-             ; dropped after a real bug in its interpolation-shift
-             ; derivation -- see the RVRS/DECIM header comments above.)
+.equ BUFLEN 1536 ; TRACK_BUFFERS words/track (hardware allocation --
+             ; this is the PHYSICAL word count, unchanged by 12-bit
+             ; packing below; only ever used for addressing/clearing the
+             ; raw buffer itself, e.g. INIT's clear loop).
+.equ LOGICAL_BUFLEN 3072 ; = BUFLEN*2, two 12-bit samples/word. Two
+             ; signed 12-bit samples share one 24-bit Y-memory word,
+             ; DOUBLING effective capture length for the same DECIM
+             ; (e.g. ~139ms becomes ~278ms at DECIM=4). Every reference
+             ; to "capture length" or "position" below is now in
+             ; LOGICAL units (0..LOGICAL_BUFLEN-1), not plain word
+             ; indices -- see the CAP_STORE/BOUNCE_ADVANCE header
+             ; comments for the word-index/sub-phase addressing this
+             ; implies, copied verbatim from NUW-JT's own already-
+             ; hardware-verified pack/unpack layer.
+.equ DECIM 4 ; real samples skipped per stored LOGICAL sample. RAISE
+             ; this for longer, more lo-fi captures (e.g. 8=~140ms,
+             ; 16=~278ms at the doubled capacity); LOWER for shorter/
+             ; cleaner ones. Rebuild after editing. MUST keep
+             ; DECIM_SHIFT below in sync by hand -- this project's
+             ; assembler has no log2(). (Back to a plain compile-time
+             ; constant 2026-11-03; briefly a live knob, dropped after a
+             ; real bug in its interpolation-shift derivation -- see the
+             ; RVRS/DECIM header comments above.)
 .equ DECIM_SHIFT 2 ; = log2(DECIM). DECIM=1->0, 2->1, 4->2, 8->3, 16->4,
                    ; 32->5, 64->6, 128->7.
 .equ DECIM_M1 3 ; = DECIM-1
-.equ WINDOW_SAMPLES 6144 ; = BUFLEN*DECIM
+.equ WINDOW_SAMPLES 12288 ; = LOGICAL_BUFLEN*DECIM (~278ms at DECIM=4 --
+                          ; double the pre-12-bit ~139ms at the same
+                          ; DECIM, the whole point of this backport)
 .equ GAP_FLOOR 8 ; provisional -- re-measure cycle cost before trusting
 .equ GAP_CEIL 220500 ; 5 seconds -- raised from the original 1-second
                      ; default, which was clamping BEND's grow/decelerate
@@ -175,6 +260,22 @@
 .equ GAP_RANGE 220492 ; = GAP_CEIL-GAP_FLOOR, precomputed: the raw assembler
                      ; doesn't accept a parenthesized expression as an
                      ; immediate operand
+.equ FIRST_GAP_FLOOR 32 ; 2026-11-06 guard, see the RATE/trig-reset block
+                     ; below for the full reasoning -- this is NOT the same
+                     ; thing as GAP_FLOOR (8) above. GAP_FLOOR still governs
+                     ; every BEND-shrunk steady-state restart once a train
+                     ; is rolling; this separate, higher floor applies ONLY
+                     ; to the very first post-trigger gap, so an aggressive
+                     ; RATE can never let the first restart land in the
+                     ; SAME 32-sample block as this trigger's own one-time
+                     ; setup cost (RVRS's LFSR draw, GATE/CAP_POS
+                     ; derivation) -- confirmed via the real mds-certifier
+                     ; as this machine's actual worst-case block (see
+                     ; refs/GOLD_STANDARD.md Sec 6). One full RENDER block
+                     ; (32 samples, ~0.7ms) is an inaudible difference from
+                     ; GAP_FLOOR's own 8 (~0.18ms) as a ONE-TIME delay
+                     ; before the very first repeat, not a change to
+                     ; RATE/BEND's steady-state behavior at all.
 .equ DCAY_CEIL_Q23 $7eb852 ; 0.99 in Q23 (brief's explicit max)
 .equ HALF_Q23 $400000 ; 0.5, BEND's grow/shrink rate
 .equ LEVEL_THRESHOLD $000800 ; ~-72dB, below this the train is done
@@ -238,6 +339,11 @@ TRACKMEM:
         move a,y:(r6+$1b)
         move a,y:(r6+$1d)
         move a,y:(r6+$1e)
+        move a,y:(r6+$1f) ; PENDING_HALF (12-bit packing -- not strictly
+                          ; required since the write-pairing invariant
+                          ; always writes this before it's ever read,
+                          ; but cleared anyway for consistency with
+                          ; NUW-JT's own INIT)
         ; RNG_STATE (Y+28/$1c) must NOT be zero -- a Galois LFSR seeded
         ; at 0 is a fixed point (lsl(0)=0, carry always 0, so eor never
         ; fires: it would stay 0 forever, making RVRS's draw silently
@@ -383,9 +489,11 @@ RVRS_FLAG_SET:
 RVRS_DONE:
 
         ; GATE shapes the capture window (see DESIGN.md section 7): both
-        ; directions reduce to the same "missing = BUFLEN*|g|" magnitude;
-        ; the sign only decides whether the missing chunk becomes a start
-        ; delay (GATE>0) or is simply never captured (GATE<0).
+        ; directions reduce to the same "missing = LOGICAL_BUFLEN*|g|"
+        ; magnitude (LOGICAL_BUFLEN, not BUFLEN, since GATE now shapes a
+        ; LOGICAL sample count -- 12-bit packing); the sign only decides
+        ; whether the missing chunk becomes a start delay (GATE>0) or is
+        ; simply never captured (GATE<0).
         move y:(r6+$2),x0
         move x0,a
         tst a
@@ -420,12 +528,12 @@ GATE_NEG_MIN:
         move #>$7fffff,a
 GATE_NEG_OK:
         move a1,y0 ; y0 = |GATE|
-        move #>BUFLEN,x0
+        move #>LOGICAL_BUFLEN,x0
         mpy y0,x0,a ; true fraction * plain integer: a1
                                          ; lands correctly, no shift needed
-        move a1,x0 ; x0 = missing words
-        move #>BUFLEN,a
-        sub x0,a ; a = CAP_REMAIN = BUFLEN - missing
+        move a1,x0 ; x0 = missing LOGICAL samples
+        move #>LOGICAL_BUFLEN,a
+        sub x0,a ; a = CAP_REMAIN = LOGICAL_BUFLEN - missing
         move a1,y:(r6+$d)
         move a1,y:(r6+$10)
         clr a
@@ -433,14 +541,14 @@ GATE_NEG_OK:
         bra <GATE_DONE
 GATE_POS:
         move a1,y0 ; y0 = GATE (already >=0)
-        move #>BUFLEN,x0
+        move #>LOGICAL_BUFLEN,x0
         mpy y0,x0,a
-        move a1,x1 ; x1 = missing words
-        move #>BUFLEN,a
-        sub x1,a ; a = CAP_REMAIN = BUFLEN - missing
+        move a1,x1 ; x1 = missing LOGICAL samples
+        move #>LOGICAL_BUFLEN,a
+        sub x1,a ; a = CAP_REMAIN = LOGICAL_BUFLEN - missing
         move a1,y:(r6+$d)
         move a1,y:(r6+$10)
-        move x1,y1 ; y1 = missing words (mpy needs an
+        move x1,y1 ; y1 = missing LOGICAL samples (mpy needs an
                                          ; x0/x1/y0/y1 source, never a0/a1)
         move #>DECIM,x0
         mpy y1,x0,a ; plain int * plain int -- small
@@ -498,6 +606,14 @@ GATE_CAPPOS_DONE:
         mpy y0,x0,a ; fraction * plain integer, no shift
         move #>GAP_FLOOR,x0
         add x0,a
+        ; GUARD (2026-11-06): floor the FIRST post-trigger gap to one full
+        ; block (FIRST_GAP_FLOOR=32), not GAP_FLOOR(8) -- see that .equ's
+        ; own comment for the full reasoning. Cheap: once per trig, not
+        ; once per sample.
+        cmp #>FIRST_GAP_FLOOR,a
+        bge <FIRST_GAP_OK
+        move #>FIRST_GAP_FLOOR,a
+FIRST_GAP_OK:
         move a1,y:(r6+$14)
         move a1,y:(r6+$13)
 
@@ -542,6 +658,14 @@ RENDER_NOTRIG:
         move #>DCAY_CEIL_Q23,y0
         mpy x0,y0,a ; true fraction * true fraction
         move a1,y:(r6+$16)
+        move a1,n4 ; n4 = cached DCAY_MULT -- re-read from Y-memory up to
+                   ; 8x/block in BOUNCE_ADVANCE (12-bit packing's TOP/
+                   ; BOTTOM dual path both need it) plus the restart
+                   ; ACCUM_LEVEL check; caching it once per block in a
+                   ; spare register (confirmed free) carried over
+                   ; unchanged from the 24-bit NFX-BO this was rebuilt
+                   ; from. No audible change at all, purely an
+                   ; implementation efficiency win.
 
         ; (TONE's HPF_K/1-HPF_K and ALFC's LPF_K/ONE_MINUS_LPF_K setup
         ; used to be cached here, once per block, into n2/n4/n5/n6 --
@@ -644,7 +768,19 @@ RENDER_LOOP:
         ; past what's actually been captured.
         move y:(r6+$a),a
         tst a
-        beq <SKIP_BOUNCE
+        ; 2026-11-06: routed through a short-branch RELAY, not a direct
+        ; "beq <SKIP_BOUNCE" -- the 12-bit packing backport's extra code
+        ; in CAP_STORE/BOUNCE_ADVANCE between here and SKIP_BOUNCE pushes
+        ; that distance past the short branch's +/-255-word range, the
+        ; SAME real hardware-freeze-causing issue this exact backport hit
+        ; before (a `jeq` absolute jump inside this hardware `do` loop --
+        ; see [[reference_dsp56300_jcc_doloop_restriction]] / DESIGN.md
+        ; Sec 14 for the full history). Applying the fix PROACTIVELY this
+        ; rebuild, not waiting to rediscover it: a plain `beq` to a nearby
+        ; relay label that itself does a plain `bra` on to the real
+        ; target, both hops using ONLY the short-branch form, never a
+        ; Jcc/JMP/JSET/JCLR inside this loop.
+        beq <RENDER_LOOP_SKIP_RELAY
 
         ; --- CAPTURE: store a decimated word, when its own state says so ---
 
@@ -664,7 +800,28 @@ RENDER_LOOP:
         ; asm56.exe toolchain + dsp56300 interpreter, dsp56300/cyclecheck/
         ; sign_test/move_flags_test.asm56k), so "sub"'s own flags are
         ; still valid here.
-        ble <SKIP_CAPTURE
+        ;
+        ; REAL BUG, found 2026-11-04 while backporting 12-bit sample
+        ; packing to a sibling build (NFX-BO) -- NOT caused by that
+        ; backport, a pre-existing defect in THIS file, present through
+        ; all 12 rounds of this project's own hardware testing, just
+        ; never caught (losing 1 word out of 1536 at the very tail of a
+        ; long, GATE/RATE/BEND-variable capture is easy to miss by
+        ; ear). MUST be "blt" (strictly negative), not "ble": with
+        ; "ble", CAP_WINDOW_REMAIN hitting EXACTLY 0 ends capture on the
+        ; SAME sample as the window's own last valid decimated event,
+        ; dropping it entirely -- the exact same off-by-one NUW-JT's
+        ; own window-boundary fix (round 2, 2026-11-04) already found
+        ; and fixed in that file; only found here because NUW-JT's own
+        ; "verify the exact last word" probe discipline got applied to
+        ; this file's buffer too while adapting it for NFX-BO. "blt"
+        ; lets CAP_WINDOW_REMAIN reach exactly 0 on a still-valid
+        ; sample and only ends capture once it goes negative, giving
+        ; the full WINDOW_SAMPLES samples of processing. Confirmed via
+        ; probe_nfxbo.cpp (12-bit sibling, same underlying logic):
+        ; the last word came back as 0 (never written) before this
+        ; fix, correct after.
+        blt <SKIP_CAPTURE
 
         ; (The anti-alias LPF cascade and TONE's highpass used to run
         ; here, every real sample while capturing -- removed 2026-11-03.
@@ -733,21 +890,77 @@ CAPSTORE_CLAMP_LO:
         bge <CAPSTORE_CLAMPED
         move #>$800000,a
 CAPSTORE_CLAMPED:
-        move a1,y1 ; y1 = blended, clamped sample to store
+        asr #12,a,a ; quantize to signed 12-bit (12-bit packing -- see
+                    ; the header comment above INIT for the full writeup)
+        move a1,y1 ; y1 = blended, clamped, quantized half to store
 
+        ; --- 12-bit write pairing: same mechanism, and the same
+        ; reverse-specific pairing bug class (already found and fixed
+        ; there), as NUW-JT's own CAPTURE_WRITE -- reused verbatim, not
+        ; re-derived. word-index = CAP_POS>>1, sub_phase = CAP_POS&1;
+        ; each event positions its OWN value into its correct 12-bit
+        ; slot first (direction-independent), then separately decides
+        ; whether IT is the first or second half of its pair based on
+        ; direction: first_of_pair = (sub_phase == REVERSE_FLAG). ---
         move y:(r6+$c),a ; CAP_POS
+        asr #1,a,a ; word-index = CAP_POS>>1 (single shift, safe)
         move a1,n3
-        move a1,x0 ; x0 = CAP_POS, kept for the direction update below
-        move y1,y:(r3+n3) ; store
+
+        move y:(r6+$c),a
+        and #>1,a ; sub_phase = CAP_POS&1 -- and's own flags survive a
+                  ; plain move (confirmed via direct probe on NUW-JT,
+                  ; and_flags_direct_test.asm56k), no tst needed
+        move a1,x0 ; x0 = sub_phase (0 or 1)
+        bne <CAPSTORE_WPAIR_BOTTOM
+
+        ; sub_phase=0: this event's value belongs in the TOP slot
+        move y1,a
+        and #>$fff,a
+        asl #12,a,a
+        move a1,y1 ; y1 = this event's value, positioned
+        bra <CAPSTORE_WPAIR_POS_DONE
+CAPSTORE_WPAIR_BOTTOM:
+        ; sub_phase=1: this event's value belongs in the BOTTOM slot
+        ; (no shift needed)
+        move y1,a
+        and #>$fff,a
+        move a1,y1 ; y1 = this event's value, positioned
+CAPSTORE_WPAIR_POS_DONE:
+
+        move y:(r6+$1b),a ; REVERSE_FLAG
+        cmp x0,a
+        beq <CAPSTORE_FIRST_OF_PAIR
+
+        ; second of pair: combine with the first half (already
+        ; positioned when it was stashed) and write the complete word
+        ; -- n3 still holds this step's word-index, untouched since it
+        ; was set above.
+        move y:(r6+$1f),a ; PENDING_HALF (already positioned)
+        add y1,a ; a = packed word (the two positioned halves never
+                 ; overlap in bits, so this is equivalent to an OR)
+        move a1,y:(r3+n3)
+        bra <CAPSTORE_ADVANCE
+CAPSTORE_FIRST_OF_PAIR:
+        ; first of pair: stash this event's (already-positioned) value,
+        ; don't touch memory yet
+        move y1,a
+        move a1,y:(r6+$1f) ; PENDING_HALF
+CAPSTORE_ADVANCE:
 
         ; direction depends on REVERSE_FLAG (decided once per trig;
-        ; GATE_DONE already set CAP_POS's starting point to match)
+        ; GATE_DONE already set CAP_POS's starting point to match).
+        ; x0 now holds sub_phase (from the write-pairing above), not
+        ; CAP_POS any more -- CAP_POS is re-read into free scratch y1
+        ; (its old value already consumed above), same "plain move
+        ; doesn't touch CCR" trick (move_flags_test.asm56k) still
+        ; applies without needing to separately verify a MEMORY load
+        ; does too.
+        move y:(r6+$c),y1 ; CAP_POS, into free scratch
         move y:(r6+$1b),a ; REVERSE_FLAG
         tst a
-        move x0,a ; a = CAP_POS again -- plain "move" doesn't touch the
-                  ; condition codes on this hardware (proven via
-                  ; move_flags_test.asm56k), so tst's flags above are
-                  ; still valid at the branch just below
+        move y1,a ; a = CAP_POS -- plain register-to-register move,
+                  ; tst's flags above are still valid at the branch
+                  ; just below
         bne <CAPSTORE_REV
         add #>1,a
         bra <CAPSTORE_POS_DONE
@@ -759,6 +972,16 @@ CAPSTORE_POS_DONE:
         sub #>1,a
         move a1,y:(r6+$d)
         bra <SKIP_CAPTURE
+; --- relay point for the shared PHASE=0 gate at the top of this loop
+; (see that comment for the full reasoning) -- reached ONLY via the
+; `beq <RENDER_LOOP_SKIP_RELAY>` at the top, never by normal fallthrough
+; (the `bra <SKIP_CAPTURE>` immediately above jumps past this
+; unconditionally on every other path). Exists purely so that "skip all
+; the way to SKIP_BOUNCE" can be done in two SHORT hops instead of one
+; long/absolute jump -- this point sits within +/-255 words of both the
+; gate check above and SKIP_BOUNCE below.
+RENDER_LOOP_SKIP_RELAY:
+        bra <SKIP_BOUNCE
 SKIP_CAPTURE:
 
         ; --- BOUNCE: gap countdown always runs, from the trig itself
@@ -890,7 +1113,8 @@ BEND_CLAMPED:
         cmp #>1,a
         beq <BOUNCE_BEGIN_PASS
         move y:(r6+$17),x0
-        move y:(r6+$16),y0
+        move n4,y0 ; cached DCAY_MULT (see the once-per-block caching
+                   ; comment above)
         mpy x0,y0,a ; true fraction * true fraction
         move a1,y:(r6+$17)
         cmp #>LEVEL_THRESHOLD,a
@@ -939,6 +1163,25 @@ GAP_KEEP:
         add x0,a
         move a1,y:(r6+$19)
         move a1,b ; b = this sample's wet output
+        move a1,n6 ; REAL BUG FIX (2026-11-07, hardware report: "harsh
+                   ; aliasing noise", confirmed via probe_nfxbo.cpp's
+                   ; Test 8 direct per-sample trace): stash the wet
+                   ; output here too. BOUNCE_ADVANCE below (taken on
+                   ; exactly 1-in-DECIM samples, the same periodic rate
+                   ; as the "aliasing" report) reuses 'b' as its OWN
+                   ; unpack scratch (BOUNCE_BOTTOM's own 4-step shift
+                   ; dance in particular) and never restores it before
+                   ; falling through to SKIP_BOUNCE's shared output
+                   ; combine -- that combine reads b1 assuming it still
+                   ; holds the value set here, but on an advance sample
+                   ; it actually holds unrelated leftover state from the
+                   ; unpack, corrupting exactly 1 sample in 4 with
+                   ; uncorrelated garbage. A corrupted sample recurring
+                   ; at a fixed DECIM-periodic rate is textbook
+                   ; aliasing (a tone at Fs/DECIM and its harmonics),
+                   ; exactly matching the report. Restored from n6
+                   ; (confirmed genuinely free scratch, see the NBAL/
+                   ; MIX caching comment above) right before SKIP_BOUNCE.
         move y:(r6+$12),a
         tst a
         ble <BOUNCE_ADVANCE
@@ -948,25 +1191,156 @@ GAP_KEEP:
 BOUNCE_ADVANCE:
         move #>DECIM_M1,a
         move a1,y:(r6+$12)
-        move y:(r6+$11),a
+
+        ; --- 12-bit packing: word-index = BOUNCE_POS>>1, sub_phase =
+        ; BOUNCE_POS&1. Unlike CAP_STORE above (which only ever writes a
+        ; COMPLETE word once, after both halves of a pair are ready),
+        ; this reads AND writes the SAME word every single decimated
+        ; step, compounding decay in place -- there is no "wait for the
+        ; pair" here, just a plain read-modify-write that must preserve
+        ; whichever half it isn't updating. sub_phase branches ONCE here
+        ; into two full duplicated paths (TOP/BOTTOM) instead of
+        ; branching once for unpack and AGAIN for pack/preserve --
+        ; measured directly (on this exact backport's first attempt) that
+        ; removing a SECOND branch this way was worth real cycles on this
+        ; emulator, more than the handful of small instructions
+        ; duplicated to get there (an earlier attempt at eliminating a
+        ; redundant Y-memory READ instead of a redundant BRANCH showed NO
+        ; measurable improvement -- branches, not memory reads, appear to
+        ; be the actual cost driver on this up-to-8x/block path). ---
+        move y:(r6+$11),a ; BOUNCE_POS
+        asr #1,a,a ; word-index = BOUNCE_POS>>1 (single shift, safe)
         move a1,n3
-        move y:(r3+n3),x0 ; raw = buffer[pos]
+
+        move y:(r6+$11),a
+        and #>1,a ; sub_phase = BOUNCE_POS&1 -- and's own flags survive
+                  ; a plain move (and_flags_direct_test.asm56k), no tst
+                  ; needed
+        bne <BOUNCE_BOTTOM
+
+; ===== TOP half path (sub_phase=0) =====
+        move y:(r3+n3),b
+        move b1,n5 ; stash the ORIGINAL word (hardware-risk hardening,
+                   ; same reasoning as NFX-BO's own first attempt --
+                   ; avoids reading this exact indexed address TWICE
+                   ; before writing it a third time, a pattern never
+                   ; exercised anywhere else in this project's own
+                   ; hardware-proven history) before the unpack below
+                   ; destroys b
+        asr #12,b,b
+        move b1,a
+        asl #12,a,a ; a1 = raw, Q23-ish, top half
+        move a1,x0 ; x0 = raw (unpacked)
+
         move y:(r6+$18),a ; REPEATS_FIRED
         cmp #>1,a
-        beq <BOUNCE_ADVANCE_FIRST
-        move y:(r6+$16),y0
+        beq <BOUNCE_ADVANCE_FIRST ; shared -- sub_phase doesn't matter
+                                  ; for the no-write first-pass case
+
+        move n4,y0 ; cached DCAY_MULT
         mpy x0,y0,a ; a = processed = raw * DCAY_MULT (new target)
-        move a1,y:(r3+n3) ; write back in place (compounds)
         ; CRITICAL: must NOT use x1 here either -- same reason as the BEND
         ; restart code above (x1 holds this sample's dry signal, live
         ; until the final output mix). Use y1 instead.
+        move a1,y1 ; y1 = processed (new target, full precision -- used
+                   ; for the interpolator below)
+
+        ; REAL BUG, found 2026-11-07 via a hardware report ("works but
+        ; extremely noisy, basically just one giant noise burst" / "whatever
+        ; is sampled is crunched into harsh noise"). The investigation went
+        ; through two dead ends before landing on the real cause, both worth
+        ; recording so they aren't re-walked:
+        ;   1. A "decay gets permanently stuck at a nonzero value" symptom
+        ;      looked like the same-register-double-shift hazard (see the
+        ;      header comment at the top of this file), but the probe that
+        ;      showed it had its OWN bug (GAP_REMAIN never re-armed between
+        ;      iterations, causing an unintended internal restart) -- once
+        ;      fixed, the original code decayed cleanly to exactly 0. Ruled
+        ;      out; nothing wrong here under single-half repeated decay.
+        ;   2. A capture/bounce word-sharing RACE (12-bit packing means two
+        ;      logical positions share one physical word, unlike NFX-BO's
+        ;      24-bit original) looked plausible given GATE=0+fastest-RATE
+        ;      symptoms, but a direct test with capture fully disabled
+        ;      (CAP_REMAIN=0) reproduced the exact same corruption. Ruled out.
+        ; The REAL cause: alternating TOP/BOTTOM visits to the SAME word
+        ; (exactly what happens as BOUNCE_POS walks forward, or revisits
+        ; early words after a fast restart) corrupts the PRESERVED other
+        ; half. "asr #12,a,a" (quantize) followed by "asl #12,a,a"
+        ; (reposition into the top 12-bit slot) on the SAME register, with
+        ; only "and #>$fff,a" (NOT a full reload) between them, leaks
+        ; residual accumulator-extension state into the positioned value's
+        ; own low 12 bits -- confirmed via direct instrumentation (expected
+        ; a clean value with zeros below bit 12, got nonzero garbage there
+        ; instead). Harmless in isolation (a lone TOP-only repeated-decay
+        ; test never surfaces it, since the next unpack re-shifts those
+        ; stray bits away before they're ever read) -- but once
+        ; BOUNCE_COMBINE ORs this "positioned" value against the PRESERVED
+        ; other half, the leaked bits silently corrupt it, compounding
+        ; worse with every further visit (confirmed via
+        ; dsp56300/cyclecheck/probe_nfxbo.cpp's Test 7, a direct alternating-
+        ; visit injection with capture fully inert). Fixed the same way the
+        ; header comment's own hazard writeup prescribes: force a full
+        ; reload through 'b' (which correctly re-establishes clean sign-
+        ; extension) before the second shift.
+        asr #12,a,a ; quantize (single shift, safe)
+        and #>$fff,a
+        move a1,b ; force a full reload (see writeup above) before the asl
+        move b1,a
+        asl #12,a,a
+        move a1,x0 ; x0 = positioned value (top slot)
+
+        move n5,a ; a = stashed original word
+        and #>$fff,a ; preserve BOTTOM bits (we updated TOP)
+        bra <BOUNCE_COMBINE
+
+; ===== BOTTOM half path (sub_phase=1) =====
+BOUNCE_BOTTOM:
+        move y:(r3+n3),b
+        move b1,n5 ; stash the ORIGINAL word -- see the TOP path's
+                   ; comment above this same line
+        asl #12,b,b
+        move b1,a
+        asr #12,a,a
+        move a1,b
+        asl #12,b,b
+        move b1,a ; a1 = raw, Q23-ish, bottom half
+        move a1,x0 ; x0 = raw (unpacked)
+
+        move y:(r6+$18),a ; REPEATS_FIRED
+        cmp #>1,a
+        beq <BOUNCE_ADVANCE_FIRST
+
+        move n4,y0 ; cached DCAY_MULT
+        mpy x0,y0,a
         move a1,y1 ; y1 = processed (new target)
+
+        asr #12,a,a ; quantize
+        and #>$fff,a
+        move a1,x0 ; x0 = positioned value (bottom slot, no shift needed)
+
+        move n5,a ; a = stashed original word (see TOP path's comment)
+        and #>$fff000,a ; preserve TOP bits (we updated BOTTOM)
+BOUNCE_COMBINE:
+        ; deliberately routes the mask through 'a' (using y0 as a
+        ; temporary holding register, free here -- DCAY_MULT already
+        ; consumed by the mpy above) rather than operating on
+        ; accumulator b -- the only proven-safe operations on b in this
+        ; file are plain moves and shifts (the unpack above), not
+        ; and/add, so this avoids an unverified instruction-operand
+        ; combination.
+        move a1,y0 ; y0 = preserved other-half bits
+        move x0,a ; a = our positioned value
+        add y0,a ; combine (the two positioned/preserved halves never
+                 ; overlap in bits, so this is equivalent to an OR)
+        move a1,y:(r3+n3) ; write back the complete word (compounds)
         bra <BOUNCE_ADVANCE_DONE
 BOUNCE_ADVANCE_FIRST:
         ; the first pass through the buffer (REPEATS_FIRED==1) is the
         ; pristine capture -- DCAY only starts compounding from the
         ; second pass onward (per the brief), so leave the buffer
-        ; untouched and feed the raw sample straight to the interpolator.
+        ; untouched and feed the raw (unpacked) sample straight to the
+        ; interpolator. No write at all in this branch, same as before
+        ; 12-bit packing.
         move x0,a
         move a1,y1 ; y1 = raw (unprocessed)
 BOUNCE_ADVANCE_DONE:
@@ -1029,6 +1403,8 @@ BOUNCE_ADVANCE_DONE:
         clr a
 BOUNCE_NOWRAP:
         move a1,y:(r6+$11)
+        move n6,b ; restore the wet output stashed above -- see the
+                  ; REAL BUG FIX comment at the top of this function
 SKIP_BOUNCE:
 
         ; --- output: dry*(1-MIX) + wet*MIX --- (MIX/1-MIX cached once

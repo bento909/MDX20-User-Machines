@@ -1,3 +1,5 @@
 # Disassembled/extracted from Elektron's proprietary factory firmware --
 # reference-only during development, not redistributable.
 refs/
+Shelved/
+__pycache__/
