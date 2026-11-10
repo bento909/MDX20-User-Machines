@@ -1,0 +1,27 @@
+{
+  "id": "org.mathsmechanic.nuwjt",
+  "display_name": "NUW-JT",
+  "description": "self-sampling overdub/freeze machine -- REC blends old buffer content back into a fresh capture, 12-bit packed, no decay train (v1)",
+  "category": "NUW",
+  "short_label": "JT",
+  "neighbour": true,
+  "params": [
+    { "name": "NBAL", "default": 3, "transform": "unipolar_q23" },
+    { "name": "GATE", "default": 64, "transform": "bipolar_q23" },
+    { "name": "REC", "default": 127, "transform": "unipolar_q23" },
+    { "name": "RVRS", "default": 127, "transform": "bipolar_q23" },
+    { "name": "MIX", "default": 64, "transform": "unipolar_q23" },
+    { "name": "STRT", "default": 0, "transform": "unipolar_q23" },
+    { "name": "LOOP", "default": 127, "transform": "unipolar_q23" },
+    { "name": "JITR", "default": 0, "transform": "unipolar_q23" }
+  ],
+  "program": {
+    "y_workset_words": 31,
+    "relocations": [
+      "RENDER_LOOP"
+    ],
+    "imports": [
+      { "symbol": "TRACKMEM", "abi_symbol": 6 }
+    ]
+  }
+}

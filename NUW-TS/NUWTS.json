@@ -1,0 +1,27 @@
+{
+  "id": "org.mathsmechanic.nuwts",
+  "display_name": "NUW-TS",
+  "description": "self-sampling overdub/freeze machine (NUW-JT's engine) with a bidirectional tape-speed/pitch-bend knob on PLAYBACK only -- -ve slower, +ve faster, 0=same speed as recorded, in discrete octave-exact steps",
+  "category": "NUW",
+  "short_label": "TS",
+  "neighbour": true,
+  "params": [
+    { "name": "NBAL", "default": 3, "transform": "unipolar_q23" },
+    { "name": "GATE", "default": 64, "transform": "bipolar_q23" },
+    { "name": "REC", "default": 127, "transform": "unipolar_q23" },
+    { "name": "RVRS", "default": 127, "transform": "bipolar_q23" },
+    { "name": "MIX", "default": 64, "transform": "unipolar_q23" },
+    { "name": "STRT", "default": 0, "transform": "unipolar_q23" },
+    { "name": "LOOP", "default": 127, "transform": "unipolar_q23" },
+    { "name": "SPED", "default": 64, "transform": "bipolar_q23" }
+  ],
+  "program": {
+    "y_workset_words": 32,
+    "relocations": [
+      "RENDER_LOOP"
+    ],
+    "imports": [
+      { "symbol": "TRACKMEM", "abi_symbol": 6 }
+    ]
+  }
+}

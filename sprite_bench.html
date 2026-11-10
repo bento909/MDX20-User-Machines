@@ -1,0 +1,821 @@
+<title>Sprite Bench</title>
+<style>
+  :root {
+    --bg: #e3dfce;
+    --surface: #d6d1bc;
+    --surface-2: #c9c3aa;
+    --pixel-off: #bcb599;
+    --pixel-on: #352c1c;
+    --accent: #b65a1c;
+    --accent-ink: #fff8ee;
+    --text: #241f14;
+    --text-dim: #6c6350;
+    --border: #a69e81;
+    --grid-line: rgba(36, 31, 20, 0.14);
+    --focus: #1f6f63;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #19160f;
+      --surface: #221d14;
+      --surface-2: #2b2317;
+      --pixel-off: #332a1b;
+      --pixel-on: #f0a94e;
+      --accent: #f0a94e;
+      --accent-ink: #1c1206;
+      --text: #ece3cf;
+      --text-dim: #a89a7c;
+      --border: #3c3220;
+      --grid-line: rgba(240, 169, 78, 0.16);
+      --focus: #5fd1bf;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #19160f;
+    --surface: #221d14;
+    --surface-2: #2b2317;
+    --pixel-off: #332a1b;
+    --pixel-on: #f0a94e;
+    --accent: #f0a94e;
+    --accent-ink: #1c1206;
+    --text: #ece3cf;
+    --text-dim: #a89a7c;
+    --border: #3c3220;
+    --grid-line: rgba(240, 169, 78, 0.16);
+    --focus: #5fd1bf;
+  }
+
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "IBM Plex Sans", system-ui, sans-serif;
+  }
+  body {
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    padding: 2.5rem 1.25rem 3.5rem;
+  }
+  .sheet {
+    width: 100%;
+    max-width: 1960px;
+    display: flex;
+    flex-direction: column;
+    gap: 1.75rem;
+  }
+
+  header {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+  h1 {
+    font-family: "VT323", "IBM Plex Mono", monospace;
+    font-size: 2.6rem;
+    line-height: 1;
+    margin: 0;
+    letter-spacing: 0.02em;
+    color: var(--text);
+    text-wrap: balance;
+  }
+  .sub {
+    margin: 0;
+    color: var(--text-dim);
+    font-size: 0.95rem;
+    max-width: 62ch;
+  }
+  .sub code {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.85em;
+    background: var(--surface-2);
+    padding: 0.1em 0.35em;
+    border-radius: 3px;
+  }
+
+  .tabs {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    padding-bottom: 0.9rem;
+  }
+  .scan-row {
+    display: flex;
+    align-items: center;
+    gap: 0.9rem;
+    flex-wrap: wrap;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 0.9rem;
+    margin-top: -0.6rem;
+  }
+  .scan-status {
+    margin: 0;
+    font-size: 0.78rem;
+    color: var(--text-dim);
+  }
+  .scan-status.ok { color: var(--focus); font-weight: 500; }
+  .scan-status.err { color: var(--accent); font-weight: 500; }
+  .tab {
+    font-family: "VT323", "IBM Plex Mono", monospace;
+    font-size: 1.25rem;
+    letter-spacing: 0.04em;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    border-radius: 6px;
+    padding: 0.35rem 1rem 0.3rem;
+    cursor: pointer;
+  }
+  .tab[aria-pressed="true"] {
+    background: var(--accent);
+    color: var(--accent-ink);
+    border-color: var(--accent);
+  }
+  .tab:focus-visible, button:focus-visible, .cell:focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 2px;
+  }
+  .tab-meta {
+    margin-left: auto;
+    align-self: center;
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    font-family: "IBM Plex Mono", monospace;
+  }
+
+  main {
+    display: flex;
+    flex-direction: column;
+    gap: 1.25rem;
+  }
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.9rem;
+  }
+
+  .toolbar {
+    display: flex;
+    gap: 1rem;
+    align-items: stretch;
+    flex-wrap: wrap;
+  }
+  .toolbar .panel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .toolbar-preview { align-items: center; }
+  .actions { flex: 1 1 260px; }
+  .actions-row { display: flex; gap: 0.6rem; flex-wrap: wrap; }
+  .readout-panel {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    justify-content: center;
+    min-width: 160px;
+  }
+
+  .grid-panel { width: 100%; }
+  .bezel {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+  }
+  #grid {
+    display: grid;
+    grid-template-columns: repeat(32, 1fr);
+    grid-template-rows: repeat(24, 1fr);
+    width: 100%;
+    aspect-ratio: 32 / 24;
+    gap: 2px;
+    background: var(--grid-line);
+    border: 2px solid var(--grid-line);
+    user-select: none;
+    touch-action: none;
+  }
+  .cell {
+    background: var(--pixel-off);
+    cursor: pointer;
+    padding: 0;
+    border: none;
+  }
+  .cell[data-on="1"] { background: var(--pixel-on); }
+  .cell.col8 { border-left: 2px solid var(--grid-line); }
+
+  .readout {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 1.1rem;
+    color: var(--text-dim);
+    min-height: 1.4em;
+  }
+
+  .label {
+    font-size: 0.72rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    align-self: flex-start;
+  }
+  #preview {
+    width: 220px;
+    height: 165px;
+    image-rendering: pixelated;
+    border: 1px solid var(--border);
+    background: var(--pixel-off);
+  }
+  .preview-caption {
+    font-size: 0.72rem;
+    color: var(--text-dim);
+    text-align: center;
+  }
+
+  .actions {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+  button {
+    font-family: "IBM Plex Sans", sans-serif;
+    font-size: 0.85rem;
+    font-weight: 500;
+    background: var(--surface-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.5rem 0.9rem;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary {
+    background: var(--accent);
+    color: var(--accent-ink);
+    border-color: var(--accent);
+  }
+
+  .output-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 1rem;
+  }
+  textarea {
+    width: 100%;
+    margin-top: 0.6rem;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.72rem;
+    line-height: 1.5;
+    font-variant-numeric: tabular-nums;
+    background: var(--surface-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.7rem;
+    resize: vertical;
+    height: 9.5rem;
+    white-space: pre;
+    overflow-x: auto;
+  }
+  .hint {
+    margin: 0.6rem 0 0;
+    font-size: 0.82rem;
+    color: var(--text-dim);
+  }
+  .copied {
+    color: var(--focus);
+    font-weight: 500;
+  }
+  .save-status {
+    margin: 0;
+    font-size: 0.78rem;
+    color: var(--text-dim);
+    min-height: 1.2em;
+  }
+  .save-status.ok { color: var(--focus); font-weight: 500; }
+  .save-status.err { color: var(--accent); font-weight: 500; }
+</style>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=VT323&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+
+<div class="sheet">
+  <header>
+    <h1>Sprite Bench</h1>
+    <p class="sub">Pixel editor for the 32&times;24 mono machine-icon sprites bundled into
+      Machinedrum USR machines via <code>mds_pack.py --bitmap</code>. Click or drag to paint.
+      Hit Save to store it here, or copy the PBM output below -- either way, tell Claude
+      which machine it's for and it'll land in the real <code>_icon.pbm</code>.</p>
+  </header>
+
+  <nav class="tabs" role="tablist" id="tabs" aria-label="Load a machine's icon">
+  </nav>
+  <div class="scan-row">
+    <button type="button" id="scanFolder">Scan a folder for _icon.pbm files&hellip;</button>
+    <input type="file" id="folderInput" webkitdirectory multiple hidden>
+    <p class="scan-status" id="scanStatus">&nbsp;</p>
+  </div>
+
+  <main>
+    <div class="toolbar">
+      <div class="panel toolbar-preview">
+        <span class="label">Actual size</span>
+        <canvas id="preview" width="32" height="24"></canvas>
+        <p class="preview-caption">How it reads on the unit's own display</p>
+      </div>
+      <div class="panel actions">
+        <span class="label">Edit</span>
+        <div class="actions-row">
+          <button id="invert">Invert</button>
+          <button id="clear">Clear</button>
+          <button id="reset">Reset to loaded</button>
+          <button id="save" class="primary">Save</button>
+        </div>
+        <p class="save-status" id="saveStatus">&nbsp;</p>
+      </div>
+      <div class="readout-panel">
+        <span class="label">Cursor</span>
+        <div class="readout" id="readout">&nbsp;</div>
+      </div>
+    </div>
+
+    <div class="panel grid-panel">
+      <div class="bezel">
+        <div id="grid" role="group" aria-label="Sprite pixel grid, 32 by 24"></div>
+      </div>
+    </div>
+  </main>
+
+  <div class="panel">
+    <div class="output-head">
+      <span class="label">PBM output</span>
+      <button class="primary" id="copy">Copy</button>
+    </div>
+    <textarea id="output" readonly spellcheck="false"></textarea>
+    <p class="hint" id="hint">Paste this back to Claude (or just say what you changed) and
+      it'll be saved into the matching <code>_icon.pbm</code> and repacked.</p>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var ROWS = 24, COLS = 32;
+
+  var SOURCE = {
+    JT: `
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 1 0 1 0 0 0 0 0 1 0 1 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 1 0 0 0 1 0 0 0 1 0 0 0 1 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 1 0 0 0 0 0 1 0 1 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 1 0 0 0 0 0 1 0 1 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 1 0 0 0 1 0 0 0 1 0 0 0 1 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 1 0 1 0 0 0 0 0 1 0 1 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 1 1 1 1 1 0 0 0 1 1 1 1 1 1 1 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 1 1 0 0 0 0 1 1 1 1 1 1 1 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 1 1 0 0 0 0 0 0 1 1 1 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 1 1 0 0 0 0 0 0 1 1 1 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 1 1 0 0 0 0 0 0 1 1 1 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 1 0 0 1 1 0 0 0 0 0 0 1 1 1 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 1 1 0 1 1 0 0 0 0 0 0 1 1 1 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 1 1 1 1 0 0 0 0 0 0 1 1 1 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0`,
+    PT: `
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 1 0 1 0 0 0 0 0 0 0 0 0 1 0 1 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 1 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 1 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 1 0 0 0 0 0 1 0 0 0 0 0 1 0 0 0 0 0 1 0 0 0 0 0 0 0
+0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0
+0 0 0 0 1 0 0 0 0 0 0 0 0 0 1 0 1 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0
+0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 1 1 1 1 1 1 0 0 0 1 1 1 1 1 1 1 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 1 1 1 1 1 1 1 0 0 1 1 1 1 1 1 1 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 1 1 0 0 0 1 1 0 0 0 0 1 1 1 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 1 1 1 1 1 1 1 0 0 0 0 1 1 1 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 1 1 1 1 1 1 0 0 0 0 0 1 1 1 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 1 1 0 0 0 0 0 0 0 0 0 1 1 1 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 1 1 0 0 0 0 0 0 0 0 0 1 1 1 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 1 1 0 0 0 0 0 0 0 0 0 1 1 1 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0`,
+    TS: `
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 1 0 0 0 1 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 1 0 0 0 1 0 0 0
+0 0 0 0 0 1 0 1 0 1 0 1 0 0 0 0 0 0 0 0 0 1 0 1 0 1 0 1 0 0 0 0
+0 0 0 0 0 0 1 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 1 0 0 0 0 0
+0 0 0 0 0 1 0 1 0 1 0 1 0 0 0 0 0 0 0 0 0 1 0 1 0 1 0 1 0 0 0 0
+0 0 0 0 1 0 0 0 1 0 0 0 1 1 1 1 1 1 1 1 1 0 0 0 1 0 0 0 1 0 0 0
+0 0 0 0 0 1 0 1 0 1 0 1 0 0 0 0 0 0 0 0 0 1 0 1 0 1 0 1 0 0 0 0
+0 0 0 0 0 0 1 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 1 0 0 0 0 0
+0 0 0 0 0 1 0 1 0 1 0 1 0 0 0 0 0 0 0 0 0 1 0 1 0 1 0 1 0 0 0 0
+0 0 0 0 1 0 0 0 1 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 1 0 0 0 1 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 1 1 1 1 1 1 1 0 0 0 1 1 1 1 1 1 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 1 1 1 1 1 1 1 0 0 1 1 1 1 1 1 1 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 1 1 1 0 0 0 0 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 1 1 1 0 0 0 0 0 1 1 1 1 1 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 1 1 1 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 1 1 1 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 1 1 1 0 0 0 0 1 1 1 1 1 1 1 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 1 1 1 0 0 0 0 1 1 1 1 1 1 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0`,
+    BO: `
+0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 0 0 0
+0 0 1 1 0 1 1 1 0 0 0 1 0 1 0 1 1 1 1 1 0 1 1 1 0 1 1 1 1 1 0 0
+0 1 1 1 0 0 1 1 0 0 1 1 1 0 1 1 0 0 0 1 0 0 1 0 1 0 1 1 1 1 1 0
+1 1 1 1 0 1 0 1 0 1 1 1 0 1 0 1 1 1 1 1 0 0 1 1 0 1 1 1 1 1 1 1
+1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1
+1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1
+1 1 1 1 1 1 1 1 1 1 1 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 0
+1 1 1 1 1 1 1 1 1 1 0 0 0 0 1 1 1 1 1 1 0 0 1 1 1 1 1 0 1 1 1 1
+1 1 1 1 0 0 1 1 1 1 0 0 0 0 1 1 0 0 1 0 0 0 0 0 1 0 1 1 0 1 0 1
+1 1 1 0 0 0 0 1 1 1 1 0 0 1 1 0 0 0 0 0 0 1 0 0 0 0 1 1 1 0 1 0
+1 1 1 0 0 0 0 1 1 1 1 1 1 1 1 0 0 0 0 1 0 0 1 0 1 0 0 0 1 1 0 1
+1 1 1 1 0 0 1 1 1 1 1 1 1 1 1 1 0 0 1 1 1 1 0 0 1 1 0 1 0 1 1 0
+1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1
+1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1
+1 1 0 0 0 0 1 1 1 0 0 1 1 1 0 1 0 1 1 1 1 0 0 1 1 0 0 1 1 0 0 1
+1 1 0 1 1 0 0 1 0 1 0 1 0 1 0 1 0 1 1 1 0 1 1 1 1 0 1 1 1 0 0 1
+1 1 0 1 1 1 0 1 0 1 0 1 0 1 0 1 0 0 0 1 0 1 1 1 0 0 1 1 1 0 0 1
+1 1 0 1 1 0 1 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 1 1 0 1 1 1 1 0 0 1
+1 1 0 0 0 0 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 1 1 0 0 0 1 1 0 0 1
+1 1 0 1 1 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 1 1 0 1 1 1 1 0 0 1
+1 1 0 1 1 0 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 0 1 1 0 1 1 1 1 1 1 1
+1 1 0 0 0 0 1 1 1 0 1 1 1 0 0 1 0 1 0 1 1 0 0 1 0 0 0 1 1 0 0 1
+1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1
+1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1`,
+    PX: `
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 1 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 1 0 1 0 0 1 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 1 0 0 1 0 0 0 1 0 0 1 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 1 0 0 1 0 0 0 0 0 1 0 0 1 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 1 0 0 1 0 0 0 1 0 0 0 1 0 0 1 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 1 0 0 1 0 0 0 0 0 1 0 0 1 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 1 0 0 1 0 0 0 1 0 0 1 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 1 0 1 0 0 1 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 1 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 1 1 1 1 1 1 1 0 0 0 1 1 0 0 0 0 0 1 1 0 0 0 0 0 0 0
+0 0 0 0 0 0 1 1 1 1 1 1 1 1 0 0 0 1 1 0 0 0 1 1 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 1 1 0 0 0 0 1 1 0 0 0 0 1 1 0 1 1 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 1 1 0 0 0 0 1 1 0 0 0 0 0 1 1 1 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 1 1 1 1 1 1 1 1 0 0 0 0 0 1 1 1 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 1 1 1 1 1 1 1 0 0 0 0 0 1 1 0 1 1 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 1 1 0 0 0 0 0 0 0 0 0 1 1 0 0 0 1 1 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 1 1 0 0 0 0 0 0 0 0 1 1 0 0 0 0 0 1 1 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0`
+  };
+
+  function parse(src) {
+    return src.trim().split(/\s+/).map(Number);
+  }
+
+  // MACHINES is the single source of truth for every tab: code (also the
+  // db save-key) -> { label, path (repo-relative, so Claude knows exactly
+  // which file to write back to), grid }. Seeded with the 6 known
+  // machines; "Scan a folder" below can refresh any of these from real
+  // disk content, or add brand-new ones it finds that aren't in this list
+  // yet -- the tool never needs source edits just to learn about a new
+  // machine's icon.
+  var MACHINES = {
+    BO: { label: "NFX-BO", path: "NFX-BO/NFXBO_icon.pbm", grid: parse(SOURCE.BO) },
+    JT: { label: "NUW-JT", path: "NUW-JT/NUWJT_icon.pbm", grid: parse(SOURCE.JT) },
+    PT: { label: "NUW-PT", path: "NUW-PT/NUWPT_icon.pbm", grid: parse(SOURCE.PT) },
+    TS: { label: "NUW-TS", path: "NUW-TS/NUWTS_icon.pbm", grid: parse(SOURCE.TS) },
+    PX: { label: "SYN-PX", path: "SYN-PX/SYNPX_icon.pbm", grid: parse(SOURCE.PX) }
+  };
+  // "NFX-BO 12 Bit" (B2) was promoted 2026-11-09 to BE NFX-BO, retiring an
+  // earlier 24-bit NFX-BO of the same name -- no separate B2 tab any more.
+  var TAB_ORDER = ["BO", "JT", "PT", "TS", "PX"]; // built-ins keep this order; scan-discovered extras append alphabetically by path
+
+  function sanitizeId(s) {
+    return s.replace(/[^A-Za-z0-9_.~:@+-]/g, "_").slice(0, 200);
+  }
+
+  function parsePbmText(text) {
+    var lines = text.replace(/\r\n/g, "\n").split("\n").filter(function (l) { return l.trim() !== ""; });
+    if (lines[0].trim() !== "P1") return null;
+    var dims = lines[1].trim().split(/\s+/).map(Number);
+    if (dims[0] !== COLS || dims[1] !== ROWS) return null;
+    var nums = lines.slice(2).join(" ").trim().split(/\s+/).map(Number);
+    if (nums.length !== ROWS * COLS || nums.some(function (n) { return n !== 0 && n !== 1; })) return null;
+    return nums;
+  }
+
+  var current = "BO";
+  var grid = MACHINES.BO.grid.slice();
+  var loadedSnapshot = grid.slice();
+  var dbApi = null;
+  var loadToken = 0; // guards against a slow db read landing after the user has already switched tabs
+
+  var gridEl = document.getElementById("grid");
+  var cells = [];
+  for (var r = 0; r < ROWS; r++) {
+    for (var c = 0; c < COLS; c++) {
+      var cell = document.createElement("div");
+      cell.className = "cell" + (c % 8 === 0 && c !== 0 ? " col8" : "");
+      cell.tabIndex = 0;
+      cell.setAttribute("role", "button");
+      cell.dataset.r = r;
+      cell.dataset.c = c;
+      gridEl.appendChild(cell);
+      cells.push(cell);
+    }
+  }
+
+  var preview = document.getElementById("preview").getContext("2d");
+  var readout = document.getElementById("readout");
+  var output = document.getElementById("output");
+
+  function render() {
+    for (var i = 0; i < grid.length; i++) {
+      cells[i].dataset.on = grid[i] ? "1" : "0";
+    }
+    paintPreview();
+    writeOutput();
+  }
+
+  function paintPreview() {
+    var sample = getComputedStyle(cells[0]);
+    var onColor = hexToRgb(getComputedStyle(document.documentElement).getPropertyValue("--pixel-on"));
+    var offColor = hexToRgb(getComputedStyle(document.documentElement).getPropertyValue("--pixel-off"));
+    var img = preview.createImageData(COLS, ROWS);
+    for (var j = 0; j < grid.length; j++) {
+      var col = grid[j] ? onColor : offColor;
+      var o = j * 4;
+      img.data[o] = col[0]; img.data[o + 1] = col[1]; img.data[o + 2] = col[2]; img.data[o + 3] = 255;
+    }
+    preview.putImageData(img, 0, 0);
+  }
+
+  function hexToRgb(hex) {
+    hex = hex.trim().replace("#", "");
+    if (hex.length === 3) hex = hex.split("").map(function (h) { return h + h; }).join("");
+    var n = parseInt(hex, 16);
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  }
+
+  function writeOutput() {
+    var lines = ["P1", COLS + " " + ROWS];
+    for (var r = 0; r < ROWS; r++) {
+      var row = grid.slice(r * COLS, r * COLS + COLS);
+      lines.push(row.join(" "));
+    }
+    output.value = lines.join("\n") + "\n";
+  }
+
+  function setCell(idx, val) {
+    if (grid[idx] === val) return;
+    grid[idx] = val;
+    cells[idx].dataset.on = val ? "1" : "0";
+    paintPreview();
+    writeOutput();
+  }
+
+  var painting = false, paintValue = 1;
+
+  gridEl.addEventListener("pointerdown", function (e) {
+    var cell = e.target.closest(".cell");
+    if (!cell) return;
+    var idx = +cell.dataset.r * COLS + +cell.dataset.c;
+    paintValue = grid[idx] ? 0 : 1;
+    painting = true;
+    setCell(idx, paintValue);
+    e.preventDefault();
+  });
+  gridEl.addEventListener("pointerover", function (e) {
+    var cell = e.target.closest(".cell");
+    if (!cell) return;
+    var r = +cell.dataset.r, c = +cell.dataset.c;
+    readout.textContent = "x " + c + "  y " + r;
+    if (painting) setCell(r * COLS + c, paintValue);
+  });
+  gridEl.addEventListener("pointerleave", function () { readout.innerHTML = "&nbsp;"; });
+  window.addEventListener("pointerup", function () { painting = false; });
+
+  gridEl.addEventListener("keydown", function (e) {
+    var cell = e.target.closest(".cell");
+    if (!cell || (e.key !== "Enter" && e.key !== " ")) return;
+    e.preventDefault();
+    var idx = +cell.dataset.r * COLS + +cell.dataset.c;
+    setCell(idx, grid[idx] ? 0 : 1);
+  });
+
+  var saveStatus = document.getElementById("saveStatus");
+  var tabsEl = document.getElementById("tabs");
+
+  function renderTabs() {
+    tabsEl.innerHTML = "";
+    var codes = Object.keys(MACHINES).sort(function (a, b) {
+      var ia = TAB_ORDER.indexOf(a), ib = TAB_ORDER.indexOf(b);
+      if (ia === -1 && ib === -1) return MACHINES[a].path.localeCompare(MACHINES[b].path);
+      if (ia === -1) return 1;
+      if (ib === -1) return -1;
+      return ia - ib;
+    });
+    codes.forEach(function (code) {
+      var btn = document.createElement("button");
+      btn.className = "tab";
+      btn.setAttribute("role", "tab");
+      btn.dataset.load = code;
+      btn.setAttribute("aria-pressed", code === current ? "true" : "false");
+      btn.textContent = MACHINES[code].label;
+      btn.title = MACHINES[code].path;
+      btn.addEventListener("click", function () {
+        tabsEl.querySelectorAll(".tab").forEach(function (t) { t.setAttribute("aria-pressed", "false"); });
+        btn.setAttribute("aria-pressed", "true");
+        loadMachine(code);
+      });
+      tabsEl.appendChild(btn);
+    });
+    var meta = document.createElement("span");
+    meta.className = "tab-meta";
+    meta.textContent = "32×24 · 1bpp";
+    tabsEl.appendChild(meta);
+  }
+
+  // Switch machines: show the known default immediately (no network
+  // wait), then check this artifact's db for a previously-Saved version
+  // and swap to it if one exists and a newer load hasn't started since.
+  function loadMachine(code) {
+    current = code;
+    var myToken = ++loadToken;
+    grid = MACHINES[code].grid.slice();
+    loadedSnapshot = grid.slice();
+    saveStatus.textContent = "";
+    saveStatus.className = "save-status";
+    render();
+
+    if (!dbApi) return;
+    dbApi.doc("icons/" + code).get().then(function (snap) {
+      if (myToken !== loadToken || !snap.exists) return;
+      var data = snap.data();
+      if (!data || !Array.isArray(data.grid) || data.grid.length !== ROWS * COLS) return;
+      grid = data.grid.slice();
+      loadedSnapshot = grid.slice();
+      render();
+      saveStatus.textContent = "Loaded your last save.";
+    }).catch(function () { /* no saved version yet, or db unreachable -- keep the default */ });
+  }
+
+  renderTabs();
+
+  document.getElementById("invert").addEventListener("click", function () {
+    grid = grid.map(function (v) { return v ? 0 : 1; });
+    render();
+  });
+  document.getElementById("clear").addEventListener("click", function () {
+    grid = grid.map(function () { return 0; });
+    render();
+  });
+  document.getElementById("reset").addEventListener("click", function () {
+    grid = loadedSnapshot.slice();
+    render();
+  });
+
+  document.getElementById("save").addEventListener("click", function () {
+    if (!dbApi) {
+      saveStatus.className = "save-status err";
+      saveStatus.textContent = "Save isn't available in this view -- copy the PBM output below instead.";
+      return;
+    }
+    var myCode = current;
+    var myPath = MACHINES[myCode].path;
+    saveStatus.className = "save-status";
+    saveStatus.textContent = "Saving...";
+    dbApi.doc("icons/" + myCode).set({ grid: grid.slice(), path: myPath, savedAt: Date.now() }).then(function () {
+      saveStatus.className = "save-status ok";
+      saveStatus.textContent = "Saved. Tell Claude to pull \"" + myCode + "\" into the repo whenever you're ready.";
+      loadedSnapshot = grid.slice();
+    }).catch(function (err) {
+      saveStatus.className = "save-status err";
+      saveStatus.textContent = "Save failed (" + (err && err.code || "unknown") + ") -- copy the PBM output below instead.";
+    });
+  });
+
+  // --- Scan a folder for *_icon.pbm files (webkitdirectory -- the plain
+  // web-platform folder picker; artifacts have no raw filesystem access,
+  // this is as close as the sandbox allows, and it's read-only: writing
+  // back still goes through Save -> db -> Claude, same as everything
+  // else here). Matches found files against known MACHINES by their
+  // repo-relative path (refreshing that tab's grid+path from real disk
+  // content); anything that doesn't match becomes a brand-new tab, so
+  // the tool never needs a source edit just to learn about a new icon. ---
+  var scanStatus = document.getElementById("scanStatus");
+  var folderInput = document.getElementById("folderInput");
+  document.getElementById("scanFolder").addEventListener("click", function () {
+    folderInput.click();
+  });
+  folderInput.addEventListener("change", function () {
+    var files = Array.prototype.filter.call(folderInput.files, function (f) {
+      return /_icon\.pbm$/i.test(f.name);
+    });
+    if (!files.length) {
+      scanStatus.className = "scan-status err";
+      scanStatus.textContent = "No *_icon.pbm files found in that folder.";
+      return;
+    }
+    scanStatus.className = "scan-status";
+    scanStatus.textContent = "Reading " + files.length + " file(s)...";
+
+    var pathIndex = {};
+    Object.keys(MACHINES).forEach(function (code) {
+      pathIndex[MACHINES[code].path.toLowerCase()] = code;
+    });
+
+    var readOne = function (file) {
+      return new Promise(function (resolve) {
+        var reader = new FileReader();
+        reader.onload = function () {
+          // webkitRelativePath looks like "<picked-folder>/NUW-JT/NUWJT_icon.pbm" --
+          // drop the picked folder's own name (not part of the repo structure)
+          var rel = file.webkitRelativePath || file.name;
+          var segs = rel.split("/");
+          var repoPath = segs.length > 1 ? segs.slice(1).join("/") : rel;
+          var parentFolder = segs.length > 2 ? segs[segs.length - 2] : (segs.length > 1 ? segs[0] : "");
+          resolve({ repoPath: repoPath, parentFolder: parentFolder, grid: parsePbmText(String(reader.result)) });
+        };
+        reader.onerror = function () { resolve(null); };
+        reader.readAsText(file);
+      });
+    };
+
+    Promise.all(files.map(readOne)).then(function (results) {
+      var matched = 0, added = 0, bad = 0;
+      results.forEach(function (r) {
+        if (!r || !r.grid) { bad++; return; }
+        var existingCode = pathIndex[r.repoPath.toLowerCase()];
+        if (existingCode) {
+          MACHINES[existingCode].grid = r.grid;
+          MACHINES[existingCode].path = r.repoPath;
+          matched++;
+        } else {
+          var code = sanitizeId(r.repoPath);
+          MACHINES[code] = { label: r.parentFolder || code, path: r.repoPath, grid: r.grid };
+          pathIndex[r.repoPath.toLowerCase()] = code;
+          added++;
+        }
+      });
+      renderTabs();
+      if (MACHINES[current]) loadMachine(current); else loadMachine(Object.keys(MACHINES)[0]);
+      scanStatus.className = "scan-status ok";
+      scanStatus.textContent = "Scanned: " + matched + " refreshed, " + added + " new" +
+        (bad ? ", " + bad + " skipped (not a 32×24 P1 PBM)" : "") + ".";
+    });
+  });
+
+  var copyBtn = document.getElementById("copy");
+  var hint = document.getElementById("hint");
+  copyBtn.addEventListener("click", function () {
+    output.select();
+    var done = function () {
+      hint.innerHTML = '<span class="copied">Copied.</span> Paste it back to Claude and say which icon it\'s for.';
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(output.value).then(done).catch(function () {
+        document.execCommand("copy"); done();
+      });
+    } else {
+      document.execCommand("copy"); done();
+    }
+  });
+
+  render();
+
+  if (typeof claude !== "undefined" && claude && typeof claude.use === "function") {
+    claude.use("db").then(function (d) {
+      dbApi = d;
+      if (dbApi) loadMachine(current); // re-check for a saved version now that db is ready
+    }).catch(function () { /* db capability unavailable in this view -- Save button will say so */ });
+  }
+})();
+</script>
