@@ -26,18 +26,6 @@ TOOLS = MACHINEDRUM_ROOT / "tools"
 MDS_TOOLS = MACHINEDRUM_ROOT / "mds-tools" / "tools"
 MINGW_BIN = r"C:\Users\thisi\AI\Workspace\Tools\mingw64\bin"  # mds-certifier needs this on PATH
 
-# Slot each machine conventionally installs to. Not derivable from the
-# folder name -- update this (and the corresponding build-steps snippet
-# in README.md) whenever a machine's convention changes or a new one
-# is added.
-DEFAULT_SLOTS = {
-    "NFX-BO": 1,
-    "NUW-JT": 1,
-    "NUW-PT": 3,
-    "NUW-TS": 2,
-    "SYN-PX": 3,
-}
-
 
 def run(cmd, env=None):
     print("+ " + " ".join(str(c) for c in cmd))
@@ -47,7 +35,7 @@ def run(cmd, env=None):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("machine", help="machine folder name, e.g. NUW-TS")
-    ap.add_argument("--slot", type=int, default=None, help="destination USR slot (default: this repo's own convention for the machine, or 1)")
+    ap.add_argument("--slot", type=int, default=1, help="destination USR slot, 1..16 (default: 1 -- you choose the real destination at install time in C6 anyway)")
     ap.add_argument("--draft", action="store_true", help="skip --certify (fast, but the resulting .mds is a DRAFT and cannot be installed)")
     args = ap.parse_args()
 
@@ -56,7 +44,7 @@ def main():
         sys.exit(f"no such machine folder: {machine_dir}")
 
     prefix = args.machine.replace("-", "").replace(" ", "")
-    slot = args.slot if args.slot is not None else DEFAULT_SLOTS.get(args.machine, 1)
+    slot = args.slot
 
     asm = machine_dir / f"{prefix}.asm56k"
     lod = machine_dir / f"{prefix}.lod"

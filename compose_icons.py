@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Compose 32x24 mono icons for NFX-BO, NUW-JT, NUW-PT, NUW-TS.
+"""Compose 32x24 mono icons for NFX-BO, NUW-JT, NUW-PT, NUW-TS, NUW-G8.
 Bottom label reuses real Elektron glyphs (B from NFX-BC, 2 from NFX-D2 --
 kept available even though nothing currently uses the "2" glyph) where
-available, hand-designed O/U/W/J/T/S/P matched to the same ~8px block
+available, hand-designed O/U/W/J/T/S/P/G/8 matched to the same ~8px block
 weight otherwise. Top motif: doubled bouncing-ball arcs for BO (echoing
 its 12-bit-packing doubled capture length -- NFX-BO was promoted from
 the former NFX-B2 on 2026-11-09, retiring the original single-bounce
 24-bit build this used to generate under the "BO" name), a loop/
 infinity arrow for JT (self-sampling loop + jitter), a tape-reel
 pictogram for TS (tape-speed), a bent-line pictogram for PT
-(pitch-bend).
+(pitch-bend), a scatter of discrete grain marks for G8 (granular
+synthesis) -- the one motif in this family that's deliberately NOT a
+continuous line, since G8 is the one machine that plays back discrete
+sampled fragments rather than a continuous waveform/loop.
 """
 import sys
 from pathlib import Path
@@ -106,6 +109,26 @@ GLYPHS = {
         "##.....",
         "##.....",
         "##.....",
+    ],
+    "G": [
+        ".#####.",
+        "#######",
+        "##.....",
+        "##.###.",
+        "##..##.",
+        "##..###",
+        "#######",
+        ".#####.",
+    ],
+    "8": [
+        ".#####.",
+        "#######",
+        "##...##",
+        ".#####.",
+        ".#####.",
+        "##...##",
+        "#######",
+        ".#####.",
     ],
 }
 
@@ -207,6 +230,24 @@ def bend_motif(grid):
     diag_line(grid, 15, 9, 21, 3)
     diag_line(grid, 21, 3, 27, 9)
 
+def grain_motif(grid):
+    """Granular-synthesis pictogram for G8: a scatter of discrete
+    'grain' marks (mixed single pixels and 2x2 blocks, for a sense of
+    varying grain size), not a continuous line -- the one motif in
+    this family that deliberately isn't, since G8 is the one machine
+    playing back discrete sampled fragments rather than a continuous
+    waveform/loop. Hand-placed (not random) so it's reproducible and
+    reads as a deliberate spray rather than noise."""
+    for (x, y) in [
+        (4, 3), (8, 2), (13, 3), (17, 2), (21, 3), (27, 2),
+        (6, 9), (11, 9), (24, 9), (29, 6), (3, 6), (30, 3),
+    ]:
+        set_pixel(grid, x, y)
+    for (x0, y0) in [(9, 5), (15, 6), (20, 5), (25, 7), (5, 7)]:
+        for dx in range(2):
+            for dy in range(2):
+                set_pixel(grid, x0 + dx, y0 + dy)
+
 def to_rows(grid):
     return ["".join(row) for row in grid]
 
@@ -257,8 +298,16 @@ if __name__ == "__main__":
     rows_pt = to_rows(g_pt)
     render(rows_pt, "NUW-PT")
 
+    # NUW-G8: grain-scatter pictogram + "G8"
+    g_g8 = blank_grid()
+    grain_motif(g_g8)
+    place_label(g_g8, ["G", "8"])
+    rows_g8 = to_rows(g_g8)
+    render(rows_g8, "NUW-G8")
+
     write_pbm(rows_bo, "nfxbo_icon.pbm")
     write_pbm(rows_jt, "nuwjt_icon.pbm")
     write_pbm(rows_ts, "nuwts_icon.pbm")
     write_pbm(rows_pt, "nuwpt_icon.pbm")
-    print("wrote nfxbo_icon.pbm, nuwjt_icon.pbm, nuwts_icon.pbm, nuwpt_icon.pbm")
+    write_pbm(rows_g8, "nuwg8_icon.pbm")
+    print("wrote nfxbo_icon.pbm, nuwjt_icon.pbm, nuwts_icon.pbm, nuwpt_icon.pbm, nuwg8_icon.pbm")

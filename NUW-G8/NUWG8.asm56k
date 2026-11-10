@@ -1,0 +1,1127 @@
+; NUW-G8 -- Neighbour User Wave Granulator. Hardware-tested and settled
+; at DECIM=4 (2026-11-10, see the .equ DECIM comment below for the full
+; A/B history). See BRIEF.md for the concept and DESIGN.md for the full
+; technical reasoning this file follows -- comments here are
+; deliberately more concise than this project's usual historical-
+; narrative style; DESIGN.md is the source of truth for WHY, this file
+; is HOW.
+;
+; Freezes a short (same LOGICAL_BUFLEN buffer as NUW-JT/PT/TS, captured
+; 1-in-DECIM real samples) 12-bit capture, then plays it back as a
+; looped synthesis grain
+; assembled by striding across the WHOLE captured buffer: GRAN sets the
+; stride, SHFT picks which interleaved sample-subset. PITCH (half-
+; semitone-quantized, +/-1 octave) rides on top via the same
+; STEP_SIZE_Q8/fractional-accumulator idea NUW-PT/TS use, just
+; advancing through grain-space instead of buffer-space. FADE smooths
+; the grain-boundary click via a HELD_WET-style ramp, independent of
+; the crossing rate (unlike NUW-PT/TS, where the ramp and the crossing
+; rate are the same knob). REC is a genuine convex-combination
+; crossfade (not NUW-JT/TS's additive formula) -- see Sec 4 below.
+;
+; Parameter block (Y, relative to r6):
+;   Y+1 NBAL  unipolar_q23  neighbour blend: 0=two back(far) 1=one back(near)
+;   Y+2 GATE  unipolar_q23  delay before capture starts. 0=immediate
+;                           (hard left). NOT a reuse of NUW-JT/PT/TS's
+;                           own bipolar GATE -- that one's negative half
+;                           shrinks the capture toward nothing at its
+;                           own hard-left extreme, the opposite of what
+;                           this machine wants. This is the positive
+;                           half of that same math, remapped unipolar.
+;   Y+3 REC   unipolar_q23  crossfade between fresh dry input and
+;                           existing captured content: write =
+;                           (1-REC_SCALE)*dry + REC_SCALE*old_sample.
+;                           0=pure dry, ~126=pure self-feeding overdub,
+;                           ~127 (knob=127 raw value) disables capture
+;                           entirely -- pure playback. Both weights
+;                           non-negative and sum to exactly 1.0: a
+;                           convex combination, CANNOT overflow Q23
+;                           full scale -- no hard clamp needed for this
+;                           blend at all (contrast NUW-JT/PT/TS's own
+;                           additive formula, which needs one).
+;   Y+4 GRAN  unipolar_q23  stride (samples skipped per grain step) --
+;                           sets a base pitch/density on its own.
+;   Y+5 SHFT  unipolar_q23  phase offset into the stride pattern,
+;                           range-limited to [0,GRAN) so the address
+;                           wrap below stays a single bounded excess.
+;   Y+6 PITCH bipolar_q23   +/-1 octave, half-semitone-quantized fine
+;                           tuning on top of whatever GRAN produces.
+;                           Table-driven (murdenihcam-style semitone
+;                           ratios), same table NUW-PT uses, recalibrated
+;                           for half the range and quantized to 2 steps/
+;                           semitone instead of interpolated continuously.
+;   Y+7 FADE  unipolar_q23  grain-boundary crossfade amount. 0=hard cut,
+;                           higher=smoother. Independent ramp rate, NOT
+;                           tied to the grain-advance rate the way NUW-
+;                           PT/TS's own ramp is tied to SPED -- so it can
+;                           blend across multiple grain-steps at high
+;                           settings, which is fine/expected here.
+;   Y+8 MIX   unipolar_q23  dry/wet on the OUTPUT only -- never affects
+;                           what's written to the buffer, same monitor-
+;                           only convention as the rest of this family.
+;
+; Persistent state (Y, relative to r6; past the 8 params):
+;   Y+9  TRACKMEM_BASE    this track's TRACK_BUFFERS base word address
+;   Y+10 PHASE            0=IDLE 1=ACTIVE. Unlike NUW-JT/PT/TS, NEVER
+;                         reverts to IDLE on its own once a trig sets it
+;                         -- sustain is indefinite (BRIEF.md's own
+;                         settled decision: the Machinedrum's per-track
+;                         envelope owns note-shaping now, not this
+;                         machine). No WINDOW_REMAIN/expiry concept at
+;                         all.
+;   Y+11 TRIG_FLAG        set by TRIG, consumed once by RENDER
+;   Y+12 LOGICAL_POS      capture write/read position, 0..LOGICAL_BUFLEN-1,
+;                         always forward (no RVRS in this machine's
+;                         knob set, so no direction state needed)
+;   Y+13 CAP_DELAY_REMAIN real samples left to wait before capture starts
+;                         (GATE-derived, Sec 5)
+;   Y+14 CAPTURE_ENABLED  0/1, latched once per trig from REC (Sec 4)
+;   Y+15 REC_SCALE        Q23 fraction, latched once per trig
+;   Y+16 ONE_MINUS_REC_SCALE  Q23 fraction, latched once per trig
+;   Y+17 PENDING_HALF     12-bit write-pairing stash, same mechanism as
+;                         the rest of this family
+;   Y+18 GRAIN_LEN        = ceil(LOGICAL_BUFLEN/GRAN), latched once per
+;                         trig (Sec 6) -- loop_pos wraps at this, not
+;                         LOGICAL_BUFLEN directly
+;   Y+19 LOOP_POS          grain-space playback position (persisted
+;                         across blocks, cached in n6 within one block --
+;                         same pattern as NUW-PT/TS's own PB_POS)
+;   Y+20 PB_FRAC           fractional phase accumulator, Q8 (persisted
+;                         across blocks, cached in n7 within one block)
+;   Y+21 STEP_SIZE_Q8      this trig's PITCH-derived rate (Sec 7)
+;   Y+22 RAMP_FRACTION     = STEP_SIZE_Q8<<15, feeds the grain-step
+;                         retarget ramp (reused mechanism, see Sec 7)
+;   Y+23 HELD_WET          continuously-ramping interpolated output
+;   Y+24 INTERP_STEP       per-sample increment ramping HELD_WET,
+;                         re-derived EITHER at a grain-step retarget
+;                         (Sec 7) OR by FADE's own independent ramp
+;                         (Sec 8) -- see RENDER_LOOP body for how the
+;                         two interact
+;   Y+25 GRAN_CACHED_SRC   GRAN's own plain-integer stride value,
+;                         latched once per trig (cached in n4 within
+;                         one block)
+;   Y+26 SHFT_CLAMPED      SHFT's own value, range-limited to [0,GRAN),
+;                         latched once per trig. Read fresh from here
+;                         each sample (NOT register-cached -- every
+;                         address/offset register is already spoken
+;                         for; see the file header note above)
+;   Y+27 FADE_RAMP_FRAC    FADE's own derived per-sample ramp fraction
+;                         (Sec 8), latched once per trig. Also read
+;                         fresh from here each sample, same reason.
+;   Y+28 CAP_REMAIN        REAL BUG FIX (2026-11-10, direct user
+;                         report): capture must stop after ONE full
+;                         lap of the buffer, same as the rest of this
+;                         family -- DESIGN.md Sec 3.3 already said so,
+;                         but the code never actually implemented it,
+;                         so capture ran continuously forever between
+;                         trigs, picking up whatever was on the
+;                         neighbour tracks the whole time (silence
+;                         included) rather than freezing after one
+;                         pass. Seeded to LOGICAL_BUFLEN at trig time,
+;                         decremented once per actual capture-write
+;                         event; once it reaches 0, capture-write (not
+;                         grain playback) stops for the rest of this
+;                         trig/pass, matching the "falls through to
+;                         skip from then on" idiom the rest of this
+;                         family already uses for an analogous budget.
+;
+; Fixed-point notes carried forward from the rest of this family
+; (empirically verified, not assumed -- see NFXBO.asm56k's own header
+; and refs/GOLD_STANDARD.md):
+;   - mpy of a TRUE Q23 fraction times a PLAIN INTEGER lands correctly
+;     in a1 directly, no extra shift needed.
+;   - mpy of two PLAIN INTEGERS (small, no fractional intent) needs
+;     "asr a" then "move a0,a" to undo the doubled-product convention.
+;   - mpy's source operands must be x0/x1/y0/y1 -- never a0/a1/b0/b1.
+;   - two consecutive immediate shifts on the SAME register silently
+;     merge into one net shift -- alternate registers (shift on b,
+;     move b1,a, shift on a) for every asr-then-asl (or asl-then-asr)
+;     pair on what should be two independent shifts.
+
+.equ BUFLEN 1536 ; TRACK_BUFFERS words/track (hardware allocation)
+.equ LOGICAL_BUFLEN 3072 ; = BUFLEN*2, two 12-bit samples/word
+.equ DECIM 4 ; capture runs on 1 of every 4 real samples (group-local
+             ; position G0 only -- see RENDER_LOOP below), not every
+             ; sample. Settled 2026-11-10 after an A/B cycle-cost pass
+             ; against DECIM=1 and DECIM=2: certified cycles dropped
+             ; from DECIM=1's 10552 (MKII) to DECIM=2's 8661 to this
+             ; build's 7723, and DECIM=4 held up on a real hardware
+             ; listen with no objection ("no need to go any higher").
+             ; Real trade-off, not free: this QUADRUPLES the real-time
+             ; window one capture spans (LOGICAL_BUFLEN*DECIM, roughly
+             ; 280-380ms instead of DECIM=1's ~70-95ms) and introduces
+             ; genuine unfiltered decimation crunch. Also worth knowing:
+             ; DECIM isn't pitch-neutral -- a captured tone's period,
+             ; measured in logical samples, shrinks by ~DECIM, so
+             ; raising DECIM acts as a second, hidden pitch-raising
+             ; knob stacked on top of the explicit PITCH control
+             ; (noticed by ear this session; not yet compensated for
+             ; in PITCH's own derivation).
+.equ FEEDBACK_GATE $001000 ; same small-signal gate idea as NUW-JT/PT/TS,
+             ; applied to REC's own self-feeding extreme (DESIGN.md Sec 4)
+             ; -- overflow isn't the risk here (the convex blend can't
+             ; overflow), DC bias/quantization buildup over many trigs
+             ; still is.
+.equ FEEDBACK_GATE_NEG $fff000 ; = -FEEDBACK_GATE (two's complement)
+.equ PITCH_SEMITONE_SCALE 3072 ; = 12*256, for +/-1 octave (half NUW-PT's
+             ; own 6144, which covered +/-2 octaves -- see DESIGN.md Sec 7)
+.equ PITCH_OCTAVE_OFFSET 12 ; semitone offset to make the derivation's
+             ; intermediate value non-negative (half NUW-PT's own 24)
+.equ PITCH_SHIFT_BASE 16 ; shift_amount = PITCH_SHIFT_BASE - octave,
+             ; recalibrated for the halved range so STEP_SIZE_Q8=64 at
+             ; PITCH's own center (raw=0) -- see DESIGN.md Sec 7 for the
+             ; worked derivation.
+.equ GRAN_MIN 1 ; no striding at all (reads the buffer directly) --
+             ; DESIGN.md Sec 6.3's proposed floor, not yet tuned by ear.
+
+; PITCH_TABLE: identical ratios to NUW-PT's own SPED_TABLE (2^(n/12)/4,
+; n=0..12) -- the table itself doesn't change between +/-1 and +/-2
+; octave range, only the scaling/offset/shift constants above do.
+PITCH_TABLE:
+.dc $200000 ; n=0:  2^(0/12)/4  = 0.250000
+.dc $21e71f ; n=1:  2^(1/12)/4  = 0.264866
+.dc $23eb36 ; n=2:  2^(2/12)/4  = 0.280616
+.dc $260dfc ; n=3:  2^(3/12)/4  = 0.297302
+.dc $285146 ; n=4:  2^(4/12)/4  = 0.314980
+.dc $2ab702 ; n=5:  2^(5/12)/4  = 0.333710
+.dc $2d413d ; n=6:  2^(6/12)/4  = 0.353553
+.dc $2ff222 ; n=7:  2^(7/12)/4  = 0.374577
+.dc $32cbfd ; n=8:  2^(8/12)/4  = 0.396850
+.dc $35d13f ; n=9:  2^(9/12)/4  = 0.420448
+.dc $39047c ; n=10: 2^(10/12)/4 = 0.445449
+.dc $3c6870 ; n=11: 2^(11/12)/4 = 0.471937
+.dc $400000 ; n=12: 2^(12/12)/4 = 0.500000
+
+; GRAN_RECIP_TABLE: 1/g as a true Q23 fraction, g=1..64 (GRAN's own
+; fixed range -- GRAN_MIN..GRAN_MIN+63). Generated offline (no division
+; hardware on this toolchain, same reason PITCH_TABLE above is
+; precomputed). Indexed by GRAN-1; see GRAN_RECIP_TABLE_REF in RENDER.
+GRAN_RECIP_TABLE:
+.dc $7fffff ; g=1:  1/1  = 1.000000
+.dc $400000 ; g=2:  1/2  = 0.500000
+.dc $2aaaab ; g=3:  1/3  = 0.333333
+.dc $200000 ; g=4:  1/4  = 0.250000
+.dc $19999a ; g=5:  1/5  = 0.200000
+.dc $155555 ; g=6:  1/6  = 0.166667
+.dc $124925 ; g=7:  1/7  = 0.142857
+.dc $100000 ; g=8:  1/8  = 0.125000
+.dc $0e38e4 ; g=9:  1/9  = 0.111111
+.dc $0ccccd ; g=10: 1/10 = 0.100000
+.dc $0ba2e9 ; g=11: 1/11 = 0.090909
+.dc $0aaaab ; g=12: 1/12 = 0.083333
+.dc $09d89e ; g=13: 1/13 = 0.076923
+.dc $092492 ; g=14: 1/14 = 0.071429
+.dc $088889 ; g=15: 1/15 = 0.066667
+.dc $080000 ; g=16: 1/16 = 0.062500
+.dc $078788 ; g=17: 1/17 = 0.058824
+.dc $071c72 ; g=18: 1/18 = 0.055556
+.dc $06bca2 ; g=19: 1/19 = 0.052632
+.dc $066666 ; g=20: 1/20 = 0.050000
+.dc $061862 ; g=21: 1/21 = 0.047619
+.dc $05d174 ; g=22: 1/22 = 0.045455
+.dc $0590b2 ; g=23: 1/23 = 0.043478
+.dc $055555 ; g=24: 1/24 = 0.041667
+.dc $051eb8 ; g=25: 1/25 = 0.040000
+.dc $04ec4f ; g=26: 1/26 = 0.038462
+.dc $04bda1 ; g=27: 1/27 = 0.037037
+.dc $049249 ; g=28: 1/28 = 0.035714
+.dc $0469ee ; g=29: 1/29 = 0.034483
+.dc $044444 ; g=30: 1/30 = 0.033333
+.dc $042108 ; g=31: 1/31 = 0.032258
+.dc $040000 ; g=32: 1/32 = 0.031250
+.dc $03e0f8 ; g=33: 1/33 = 0.030303
+.dc $03c3c4 ; g=34: 1/34 = 0.029412
+.dc $03a83b ; g=35: 1/35 = 0.028571
+.dc $038e39 ; g=36: 1/36 = 0.027778
+.dc $03759f ; g=37: 1/37 = 0.027027
+.dc $035e51 ; g=38: 1/38 = 0.026316
+.dc $034835 ; g=39: 1/39 = 0.025641
+.dc $033333 ; g=40: 1/40 = 0.025000
+.dc $031f38 ; g=41: 1/41 = 0.024390
+.dc $030c31 ; g=42: 1/42 = 0.023810
+.dc $02fa0c ; g=43: 1/43 = 0.023256
+.dc $02e8ba ; g=44: 1/44 = 0.022727
+.dc $02d82e ; g=45: 1/45 = 0.022222
+.dc $02c859 ; g=46: 1/46 = 0.021739
+.dc $02b931 ; g=47: 1/47 = 0.021277
+.dc $02aaab ; g=48: 1/48 = 0.020833
+.dc $029cbc ; g=49: 1/49 = 0.020408
+.dc $028f5c ; g=50: 1/50 = 0.020000
+.dc $028283 ; g=51: 1/51 = 0.019608
+.dc $027627 ; g=52: 1/52 = 0.019231
+.dc $026a44 ; g=53: 1/53 = 0.018868
+.dc $025ed1 ; g=54: 1/54 = 0.018519
+.dc $0253c8 ; g=55: 1/55 = 0.018182
+.dc $024925 ; g=56: 1/56 = 0.017857
+.dc $023ee1 ; g=57: 1/57 = 0.017544
+.dc $0234f7 ; g=58: 1/58 = 0.017241
+.dc $022b64 ; g=59: 1/59 = 0.016949
+.dc $022222 ; g=60: 1/60 = 0.016667
+.dc $02192e ; g=61: 1/61 = 0.016393
+.dc $021084 ; g=62: 1/62 = 0.016129
+.dc $020821 ; g=63: 1/63 = 0.015873
+.dc $020000 ; g=64: 1/64 = 0.015625
+
+INIT:
+        ; TRACKMEM base = r1 * 1536, rounded up to the next 512-word
+        ; boundary. Same pattern as the rest of this family (see
+        ; refs/GOLD_STANDARD.md Sec 3).
+        move r1,y0
+        move #>BUFLEN,x0
+        mpy y0,x0,a
+        asr a
+        move a0,a
+        move a1,y1
+TRACKMEM:
+        move #>$0,x0 ; placeholder, patched by the loader (kind-2 import,
+                     ; symbol 6)
+        move y1,a
+        add x0,a
+        move a1,r0
+        move r0,y:(r6+$9)
+
+        ; clear this track's whole TRACK_BUFFERS region
+        move #>$ffffff,m0
+        clr a
+        rep #BUFLEN
+        move a,y:(r0)+
+
+        clr a
+        move a,y:(r6+$a) ; PHASE
+        move a,y:(r6+$b) ; TRIG_FLAG
+        move a,y:(r6+$c) ; LOGICAL_POS
+        move a,y:(r6+$d) ; CAP_DELAY_REMAIN
+        move a,y:(r6+$e) ; CAPTURE_ENABLED
+        move a,y:(r6+$f) ; REC_SCALE
+        move a,y:(r6+$10) ; ONE_MINUS_REC_SCALE
+        move a,y:(r6+$11) ; PENDING_HALF
+        move a,y:(r6+$12) ; GRAIN_LEN
+        move a,y:(r6+$13) ; LOOP_POS
+        move a,y:(r6+$14) ; PB_FRAC
+        move a,y:(r6+$15) ; STEP_SIZE_Q8
+        move a,y:(r6+$16) ; RAMP_FRACTION
+        move a,y:(r6+$17) ; HELD_WET
+        move a,y:(r6+$18) ; INTERP_STEP
+        move a,y:(r6+$19) ; GRAN_CACHED_SRC
+        move a,y:(r6+$1a) ; SHFT_CLAMPED
+        move a,y:(r6+$1b) ; FADE_RAMP_FRAC
+        move a,y:(r6+$1c) ; CAP_REMAIN
+        rts
+
+TRIG:
+        move #>$1,x0
+        move x0,y:(r6+$b)
+        rts
+
+RENDER:
+        ; --- once per block: consume a fresh trig, if any ---
+        move y:(r6+$b),a
+        tst a
+        beq <RENDER_NOTRIG
+        clr a
+        move a,y:(r6+$b)
+
+        ; --- REC: decide CAPTURE_ENABLED, REC_SCALE, ONE_MINUS_REC_SCALE
+        ; once per trig. Same knob=127 snap-to-exact-disable convention
+        ; as the rest of this family (firmware's knob<<16 encoding falls
+        ; short of Q23's true $7fffff ceiling). ---
+        move y:(r6+$3),x0 ; REC, raw unipolar_q23
+        move x0,a
+        cmp #>$7f0000,a
+        bge <REC_DISABLE
+        move #>1,a
+        move a1,y:(r6+$e) ; CAPTURE_ENABLED=1
+        move x0,a
+        move a1,y:(r6+$f) ; REC_SCALE = REC's own raw fraction directly
+        move #>$7fffff,a
+        sub x0,a ; a = 1-REC_SCALE, full accumulator -- REC's own raw
+                 ; value is always < $7f0000 here, so this cannot
+                 ; itself underflow
+        move a1,y:(r6+$10) ; ONE_MINUS_REC_SCALE
+        bra <REC_DONE
+REC_DISABLE:
+        clr a
+        move a1,y:(r6+$e) ; CAPTURE_ENABLED=0
+        move a1,y:(r6+$f) ; REC_SCALE=0 (unused when disabled)
+        move a1,y:(r6+$10) ; ONE_MINUS_REC_SCALE=0 (ditto)
+REC_DONE:
+
+        ; --- GATE: delay-only, unipolar. CAP_DELAY_REMAIN in REAL
+        ; samples. Delay ceiling proposed as one whole LOGICAL_BUFLEN's
+        ; worth of real time (DESIGN.md Sec 5, not yet confirmed by
+        ; ear). No CAP_REMAIN-style shrink concept -- GATE never
+        ; shrinks the capture once it starts, only delays the start.
+        ; DECIM multiply needed here now (DECIM>1 experiments) --
+        ; logical samples and real samples are no longer the same unit,
+        ; same reason the rest of this family's own GATE_POS branch
+        ; needs this multiply (plain int * plain int, undo the
+        ; doubled-product). ---
+        move y:(r6+$2),y0 ; GATE, raw unipolar_q23
+        move #>LOGICAL_BUFLEN,x0
+        mpy y0,x0,a ; true fraction * plain integer -- lands in a1 directly
+        move a1,y1 ; y1 = delay, in LOGICAL samples
+        move #>DECIM,x0
+        mpy y1,x0,a ; plain int * plain int -- needs the doubled-
+                    ; product undo
+        asr a
+        move a0,a
+        move a1,y:(r6+$d) ; CAP_DELAY_REMAIN, now in REAL samples
+
+        ; --- GRAN: stride, as a plain integer. Unipolar_q23 raw scaled
+        ; up from GRAN_MIN -- exact max/scaling not yet tuned by ear
+        ; (DESIGN.md Sec 6.3); placeholder range 1..64 for now. ---
+        move y:(r6+$4),y0 ; GRAN, raw unipolar_q23
+        move #>63,x0 ; range span (GRAN_MIN=1 .. 1+63=64)
+        mpy y0,x0,a ; true fraction * plain integer -- a1 lands directly
+        move #>GRAN_MIN,x0
+        add x0,a ; a = GRAN_MIN + scaled span
+        move a1,y:(r6+$19) ; GRAN_CACHED_SRC
+        move a1,x1 ; x1 = GRAN (kept live for GRAIN_LEN/SHFT below)
+
+        ; GRAIN_LEN = floor(LOGICAL_BUFLEN / GRAN), via a 64-entry Q23
+        ; reciprocal table indexed by GRAN-1 (no division hardware on
+        ; this toolchain; GRAN's own range is fixed/small by this
+        ; machine's own design -- GRAN_MIN..GRAN_MIN+63 -- so a lookup
+        ; table is cheap and exact). FLOOR, not CEIL: always
+        ; conservative -- a grain that doesn't quite reach the buffer's
+        ; last few leftover samples on a non-evenly-dividing stride is
+        ; fine, overshooting the buffer is not.
+        ;
+        ; REAL BUG, found by mds-certifier's fuzz run (not by eye): the
+        ; original placeholder here used plain unscaled LOGICAL_BUFLEN
+        ; as GRAIN_LEN. That breaks the "at most one wrap" bound the
+        ; address calc in RENDER_LOOP depends on (DESIGN.md Sec 6.2) --
+        ; with GRAIN_LEN that large, loop_pos could reach up to
+        ; LOGICAL_BUFLEN-1, so loop_pos*GRAN could exceed LOGICAL_BUFLEN
+        ; by many multiples of it, not the single bounded excess the
+        ; wrap check (a single compare+subtract) can actually correct.
+        ; Certifier caught it as a genuine out-of-bounds Y-memory read
+        ; on the first certify attempt.
+        move x1,a ; x1 still holds GRAN
+        sub #>1,a
+        move a1,n4 ; n4 = GRAN-1 (table index) -- free here, the
+                   ; once-per-block cache section hasn't run yet
+GRAN_RECIP_TABLE_REF:
+        move #>GRAN_RECIP_TABLE,r4
+        lua (r4)+n4,r0 ; SAME-NUMBER (r4/n4) pairing required -- see
+                       ; PITCH_TABLE_REF below for the direct-probe
+                       ; citation for this instruction form (r4 is free
+                       ; here; this trig's own PITCH derivation doesn't
+                       ; claim r4 until later in sequence)
+        move p:(r0),y0 ; y0 = 1/GRAN, true Q23 fraction
+        move #>LOGICAL_BUFLEN,x0
+        mpy y0,x0,a ; a = floor(LOGICAL_BUFLEN/GRAN) approx -- true
+                    ; fraction * plain integer lands in a1 directly
+        move a1,y0 ; y0 = candidate GRAIN_LEN
+
+        ; defensive check: candidate*GRAN must not exceed LOGICAL_BUFLEN
+        ; -- guards against the reciprocal table's own rounding ever
+        ; landing one unit high (mpy of two plain integers needs the
+        ; doubled-product undo).
+        mpy y0,x1,a ; candidate*GRAN (x1 still holds GRAN)
+        asr a
+        move a0,a
+        cmp #>LOGICAL_BUFLEN,a
+        ble <GRAINLEN_OK
+        move y0,a
+        sub #>1,a
+        move a1,y0
+GRAINLEN_OK:
+        move y0,a
+        cmp #>1,a
+        bge <GRAINLEN_FLOOR_OK
+        move #>1,a
+GRAINLEN_FLOOR_OK:
+        move a1,y:(r6+$12) ; GRAIN_LEN
+
+        ; --- SHFT: range-limited to [0,GRAN) so the address wrap in
+        ; RENDER_LOOP stays a single bounded excess (DESIGN.md Sec 6.2).
+        ; No division hardware, so this can't be a true "mod GRAN" --
+        ; FIRST-PASS PLACEHOLDER: scale SHFT's own raw fraction directly
+        ; by the already-computed GRAN (x1 still holds it), which lands
+        ; in [0,GRAN) by construction (a true fraction times GRAN is
+        ; always < GRAN) without needing a modulo at all. ---
+        move y:(r6+$5),y0 ; SHFT, raw unipolar_q23
+        mpy y0,x1,a ; true fraction * plain integer (GRAN) -- a1 lands
+                    ; directly, result in [0,GRAN)
+        move a1,y:(r6+$1a) ; SHFT_CLAMPED
+
+        ; --- PITCH: half-semitone-quantized, +/-1 octave. Same table-
+        ; driven derivation as NUW-PT's own SPED, recalibrated (see the
+        ; .equ constants above and DESIGN.md Sec 7), with the
+        ; interpolation fraction QUANTIZED to {0, 0.5} instead of
+        ; continuous -- the "half-semitone" resolution the brief calls
+        ; for, using the SAME 12-entries/octave table rather than a new
+        ; 24-entry one. ---
+        move y:(r6+$6),x0 ; PITCH, raw bipolar_q23
+        move #>PITCH_SEMITONE_SCALE,y0
+        mpy x0,y0,a ; a = raw*3072 -- signed Q8 "semitones" value,
+                    ; [-3072,+3072)
+        move a1,n3 ; n3 = t_q8 (stash the full signed value)
+        asr #8,a,a ; a = whole_semitone (floor div)
+        move a1,x1 ; x1 = whole_semitone
+
+        ; half_semitone flag: is t_q8's own remainder (bits 0-7) past
+        ; the half-way point (128)? Quantizes the continuous remainder
+        ; down to a single 0/1 bit BEFORE any table math, rather than
+        ; computing a continuous frac_q23 and rounding it after --
+        ; cheaper, and avoids ever representing more than 2 positions.
+        move n3,a ; a = t_q8 (reload)
+        and #>$ff,a ; a = frac_remainder (0..255)
+        cmp #>128,a
+        blt <PITCH_HALF_DOWN
+        move #>$400000,y1 ; y1 = frac_q23 = 0.5 (the half-sharp case)
+        bra <PITCH_HALF_DONE
+PITCH_HALF_DOWN:
+        clr a
+        move a1,y1 ; y1 = frac_q23 = 0 (exact semitone)
+PITCH_HALF_DONE:
+
+        move x1,a
+        move #>PITCH_OCTAVE_OFFSET,x0
+        add x0,a ; a = t = whole_semitone+12, now in [0,23]
+        move a1,x1 ; x1 = t
+        move #>$0aaaab,y0 ; 1/12, rounded up -- same idiom NUW-PT uses
+        mpy x1,y0,a ; a = octave = t/12 (0 or 1)
+        move a1,n3 ; n3 = octave
+        move a1,a
+        asl #2,a,a ; a = 4*octave
+        move a1,x0
+        asl #1,a,a ; a = 8*octave
+        add x0,a ; a = 12*octave
+        move x1,b
+        sub a,b ; b = t-12*octave = semitone_within_octave (0..11)
+        move b1,n4 ; n4 = table index (temporarily -- overwritten by the
+                   ; once-per-block cache section below, same as NUW-PT)
+
+        move #>PITCH_SHIFT_BASE,a
+        move n3,x0
+        sub x0,a ; a = shift_amount = PITCH_SHIFT_BASE - octave
+        move a1,y:(r6+$11) ; stash in PENDING_HALF -- inert here, capture
+                           ; hasn't run yet this trig (same trick NUW-PT
+                           ; uses for its own analogous shift_amount)
+
+PITCH_TABLE_REF:
+        move #>PITCH_TABLE,r4
+        lua (r4)+n4,r0 ; r0 = table_base + index -- SAME-NUMBER (r4/n4)
+                       ; pairing required, confirmed by NUW-PT's own
+                       ; direct probe before trusting this instruction form
+        move p:(r0)+,x0 ; x0 = T[index]
+        move p:(r0),x1 ; x1 = T[index+1]
+        move x1,b
+        sub x0,b ; b = T[index+1]-T[index]
+        move b1,y0 ; y0 = diff
+        mpy y1,y0,a ; a = frac_q23*diff -- frac_q23 is now exactly 0 or
+                    ; 0.5, so this lands on exactly T[index] or exactly
+                    ; the true midpoint, never anything else
+        add x0,a ; a = T[index] + frac*diff
+
+        move y:(r6+$11),x0 ; shift_amount
+        asr x0,a,a ; a = STEP_SIZE_Q8
+        move #>255,x0
+        cmp x0,a
+        ble <PITCH_STEP_OK
+        move x0,a
+PITCH_STEP_OK:
+        move a1,y:(r6+$15) ; STEP_SIZE_Q8
+        move a1,x0
+        asl #15,a,a ; RAMP_FRACTION = STEP_SIZE_Q8<<15, same fixed-
+                    ; immediate-shift derivation as NUW-PT/TS's own
+        move a1,y:(r6+$16) ; RAMP_FRACTION
+
+        ; --- FADE: independent per-sample ramp fraction, NOT tied to
+        ; the grain-advance rate (DESIGN.md Sec 8). FADE=0 -> instant
+        ; (ramp_fraction=~1.0); higher FADE -> smoother/slower
+        ; (ramp_fraction shrinks toward 0). Inverted from the raw knob
+        ; directly, same "1-x" idiom as NBAL/MIX. ---
+        move #>$7fffff,a
+        move y:(r6+$7),y0 ; FADE, raw unipolar_q23
+        sub y0,a
+        move a1,y:(r6+$1b) ; FADE_RAMP_FRAC
+
+        ; --- reset per-trig state: LOGICAL_POS, LOOP_POS, PB_FRAC,
+        ; PENDING_HALF (now safe to clear -- PITCH's own shift_amount
+        ; stash above has already been consumed), HELD_WET, INTERP_STEP.
+        ; PHASE set ACTIVE and left there (Sec above -- no expiry). ---
+        clr a
+        move a,y:(r6+$c) ; LOGICAL_POS=0
+        move a,y:(r6+$13) ; LOOP_POS=0
+        move a,y:(r6+$14) ; PB_FRAC=0
+        move a,y:(r6+$11) ; PENDING_HALF=0
+        move a,y:(r6+$17) ; HELD_WET=0
+        move a,y:(r6+$18) ; INTERP_STEP=0
+        move #>LOGICAL_BUFLEN,a
+        move a,y:(r6+$1c) ; CAP_REMAIN -- one full lap, then capture
+                          ; freezes for the rest of this trig (real bug
+                          ; fix, see the Y+28 header comment above)
+        move #>1,a
+        move a,y:(r6+$a) ; PHASE=ACTIVE
+RENDER_NOTRIG:
+
+        ; --- once per block: neighbour buffers for NBAL (same setup as
+        ; the rest of this family) ---
+        move y:>$7f0,r5
+        move #>$ffffff,m5
+        move y:(r5+2),r2 ; two back
+        move y:(r5+1),r5 ; one back
+        move #>$ffffff,m2
+
+        move y:(r6+$9),r3 ; r3 = this track's buffer base
+        move #>$ffffff,m3
+
+        ; --- once per block: cache NBAL/MIX derived values (same
+        ; hoist-out-of-the-hot-loop principle as the rest of this family) ---
+        move #>$7fffff,a
+        move y:(r6+$1),y0 ; NBAL
+        sub y0,a
+        move a1,n0 ; n0 = cached 1-NBAL
+        move y:(r6+$1),n1 ; n1 = cached NBAL
+
+        move y:(r6+$8),a ; MIX
+        cmp #>$7f0000,a
+        bge <PRE_MIX_FULL_WET
+        move #>$7fffff,a
+        move y:(r6+$8),x0
+        sub x0,a
+        move a1,r1 ; r1 = cached 1-MIX
+        bra <PRE_MIX_DONE
+PRE_MIX_FULL_WET:
+        clr a
+        move a1,r1
+PRE_MIX_DONE:
+        move y:(r6+$8),r4 ; r4 = cached MIX
+
+        ; --- cache this trig's grain/pitch constants (same hoist
+        ; principle) ---
+        move y:(r6+$19),n4 ; n4 = cached GRAN
+        move y:(r6+$12),n5 ; n5 = cached GRAIN_LEN
+        move y:(r6+$16),n2 ; n2 = cached RAMP_FRACTION
+        move y:(r6+$15),r0 ; r0 = cached STEP_SIZE_Q8
+
+        ; --- LOOP_POS/PB_FRAC are STATE, not constants -- persist
+        ; across blocks via n6/n7, same pattern as the rest of this
+        ; family's own PB_POS/PB_FRAC ---
+        move y:(r6+$13),n6 ; n6 = cached LOOP_POS
+        move y:(r6+$14),n7 ; n7 = cached PB_FRAC
+; ============================================================================
+; RENDER_LOOP -- UNLIKE the rest of this family, there is no "3 plain
+; positions + 1 capture position" split: only G0 of the 4 group-local
+; positions below runs the capture-write body (DECIM=4 -- see the .equ
+; DECIM comment above); all 4 run the grain-playback-read body. See
+; DESIGN.md Sec 3 for why this doesn't fit the existing bulk-pass
+; template.
+;
+; Manually unrolled 4x per iteration, not a hardware `do`-loop around
+; one shared copy of the body. A hardware-looped version was built and
+; measured this session (smaller program, near-identical cycles, since
+; looping removes duplicate bytes but not duplicate work) but this
+; unrolled version is the one that's actually been hardware-tested, so
+; it's the one kept as the real machine. (Also confirmed this session:
+; the project's old "no nested do-loops" caution was narrower than
+; believed -- it's specifically the two-word Jcc/JMP/JSET/JCLR class,
+; not ordinary Bcc branches -- so a future loop-fold pass is safe to
+; revisit if this machine's program size ever becomes a real problem.)
+; ============================================================================
+RENDER_LOOP:
+        do #8,RENDER_END
+        ; ================= SAMPLE (group-local position 0) =================
+        move y:(r2)+,x0 ; two_back
+        move y:(r5)+,y1 ; one_back
+        move n0,y0
+        mpy x0,y0,a
+        move n1,x0
+        macr y1,x0,a
+        move a1,x1 ; x1 = dry, live until this sample's own output mix
+
+        clr b ; default silent wet output
+
+        move y:(r6+$a),a ; PHASE
+        tst a
+        beq <TAIL_G0
+
+        ; --- capture: DECIM=4, confined to G0 only (G1/G2/G3 below do
+        ; grain playback only, no capture body at all) -- see the
+        ; .equ DECIM comment above for why. ---
+        move y:(r6+$e),a ; CAPTURE_ENABLED
+        tst a
+        beq <SKIP_CAP_G0
+
+        move y:(r6+$d),a ; CAP_DELAY_REMAIN
+        tst a
+        ble <CAP_ACTIVE_G0
+        sub #>1,a
+        move a1,y:(r6+$d)
+        bra <SKIP_CAP_G0
+CAP_ACTIVE_G0:
+        move y:(r6+$1c),a ; CAP_REMAIN
+        tst a
+        ble <SKIP_CAP_G0 ; one full lap already done -- freeze, see the
+                         ; Y+28 header comment
+        sub #>1,a
+        move a1,y:(r6+$1c)
+        move y:(r6+$c),a ; LOGICAL_POS
+        asr #1,a,a ; word-index = LOGICAL_POS>>1
+        move a1,n3
+        move y:(r6+$c),a
+        and #>1,a ; sub_phase = LOGICAL_POS&1
+        bne <CREAD_BOTTOM_G0
+        move y:(r3+n3),b
+        asr #12,b,b
+        move b1,a
+        asl #12,a,a
+        bra <CREAD_DONE_G0
+CREAD_BOTTOM_G0:
+        move y:(r3+n3),b
+        asl #12,b,b
+        move b1,a
+        asr #12,a,a
+        move a1,b
+        asl #12,b,b
+        move b1,a
+CREAD_DONE_G0:
+        move a1,y1 ; y1 = old_sample
+
+        move y:(r6+$f),y0 ; REC_SCALE
+        mpy y1,y0,a ; REC_SCALE*old_sample
+        cmp #>FEEDBACK_GATE,a
+        bge <FBGATE_KEEP_G0
+        cmp #>FEEDBACK_GATE_NEG,a
+        ble <FBGATE_KEEP_G0
+        clr a
+FBGATE_KEEP_G0:
+        move a1,x0 ; x0 = gated REC_SCALE*old_sample
+
+        move y:(r6+$10),y0 ; ONE_MINUS_REC_SCALE
+        mpy x1,y0,a ; ONE_MINUS_REC_SCALE*dry
+        add x0,a ; a = write -- convex combination, cannot overflow,
+                 ; no clamp needed (DESIGN.md Sec 4)
+        asr #12,a,a ; quantize to signed 12-bit
+        move a1,y1 ; y1 = quantized write value
+
+        ; write-pairing: unlike the rest of this family, LOGICAL_POS is
+        ; ALWAYS forward here (no RVRS knob, no REVERSE_FLAG) -- so
+        ; sub_phase=0 is always the first half of a pair and
+        ; sub_phase=1 always completes it, no direction check needed.
+        move y:(r6+$c),a ; LOGICAL_POS
+        and #>1,a ; sub_phase
+        move a1,x0
+        bne <CWRITE_BOTTOM_G0
+        move y1,a
+        and #>$fff,a
+        asl #12,a,a
+        move a1,y:(r6+$11) ; PENDING_HALF (top half, positioned)
+        bra <CWRITE_DONE_G0
+CWRITE_BOTTOM_G0:
+        move y1,a
+        and #>$fff,a
+        move a1,x0 ; x0 = bottom half, positioned (no shift needed)
+        move y:(r6+$11),a ; PENDING_HALF (top half, already positioned)
+        add x0,a
+        move a1,y:(r3+n3) ; complete word written
+CWRITE_DONE_G0:
+
+        ; advance LOGICAL_POS, wrap forward-only
+        move y:(r6+$c),a
+        add #>1,a
+        cmp #>LOGICAL_BUFLEN,a
+        blt <CPOS_OK_G0
+        sub #>LOGICAL_BUFLEN,a
+CPOS_OK_G0:
+        move a1,y:(r6+$c)
+SKIP_CAP_G0:
+
+        ; --- grain playback: advance LOOP_POS via the PITCH accumulator,
+        ; compute the strided read address, ramp HELD_WET via FADE ---
+        move n7,a ; PB_FRAC
+        move r0,x0 ; STEP_SIZE_Q8
+        add x0,a
+        move #>256,x0
+        cmp x0,a
+        blt <PB_NOADV_G0
+        sub #>256,a
+        move a1,n7
+        move n6,a ; LOOP_POS
+        add #>1,a
+        move n5,x0 ; GRAIN_LEN
+        cmp x0,a
+        blt <LOOPPOS_OK_G0
+        clr a ; wrap to 0
+LOOPPOS_OK_G0:
+        move a1,n6 ; new LOOP_POS
+
+        ; real_addr = SHFT_CLAMPED + LOOP_POS*GRAN
+        move n6,x0
+        move n4,y0 ; GRAN (plain int)
+        mpy x0,y0,a ; plain int * plain int -- undo the doubled product
+        asr a
+        move a0,a
+        move y:(r6+$1a),x0 ; SHFT_CLAMPED (read fresh -- not cached, see
+                           ; file header note)
+        add x0,a ; a = real_addr, bounded to < LOGICAL_BUFLEN+GRAN-1
+                 ; (DESIGN.md Sec 6.2's own proof)
+        cmp #>LOGICAL_BUFLEN,a
+        blt <GADDR_OK_G0
+        sub #>LOGICAL_BUFLEN,a
+GADDR_OK_G0:
+        move a1,x0 ; x0 = physical address
+        asr #1,a,a ; word-index = physical address >> 1
+        move a1,n3
+        move x0,a
+        and #>1,a ; sub_phase = real_addr & 1
+        bne <GREAD_BOTTOM_G0
+        move y:(r3+n3),b
+        asr #12,b,b
+        move b1,a
+        asl #12,a,a
+        bra <GREAD_DONE_G0
+GREAD_BOTTOM_G0:
+        move y:(r3+n3),b
+        asl #12,b,b
+        move b1,a
+        asr #12,a,a
+        move a1,b
+        asl #12,b,b
+        move b1,a
+GREAD_DONE_G0:
+        move a1,y0 ; y0 = new target
+
+        ; INTERP_STEP: on a grain-step crossing (PB_FRAC just wrapped),
+        ; re-derive it from RAMP_FRACTION (PITCH-driven, same halve-
+        ; then-double pattern as the rest of this family) so the ramp
+        ; still tracks the grain's own advance rate. FADE's own
+        ; independent ramp (Sec 8) applies EVERY sample regardless of
+        ; whether a crossing happened, layered on top.
+        move y0,a
+        move y:(r6+$17),x0 ; HELD_WET
+        sub x0,a ; a = target-HELD_WET, full accumulator
+        asr a ; a = diff/2
+        move a1,x0
+        move n2,y0 ; RAMP_FRACTION
+        mpy x0,y0,a
+        asl a
+        move a1,y:(r6+$18) ; INTERP_STEP (grain-crossing contribution)
+        bra <PB_SAME_G0
+PB_NOADV_G0:
+        move a1,n7 ; no crossing -- just store the incremented PB_FRAC
+PB_SAME_G0:
+        move y:(r6+$18),x0 ; INTERP_STEP
+        move y:(r6+$1b),y0 ; FADE_RAMP_FRAC (read fresh, see file header
+                           ; note)
+        mpy x0,y0,a ; a = INTERP_STEP*FADE_RAMP_FRAC -- scales how much
+                    ; of this sample's ramp step actually applies;
+                    ; FADE_RAMP_FRAC near 1.0 (low FADE) passes nearly
+                    ; all of it through (fast/hard), near 0 (high FADE)
+                    ; passes almost none (slow/smooth)
+        move y:(r6+$17),x0 ; HELD_WET
+        add x0,a
+        move a1,y:(r6+$17)
+        move a1,b
+        bra <TAIL_G0
+ENDING_G0:
+        ; (unreachable -- PHASE never auto-expires in this machine;
+        ; kept as a label target only in case a future round adds one)
+TAIL_G0:
+        move r1,y0
+        mpy x1,y0,a
+        move r4,y0
+        move b1,x0
+        macr x0,y0,a
+        move a,y:(r7)+
+
+        ; ================= SAMPLE (group-local position 1) =================
+        move y:(r2)+,x0
+        move y:(r5)+,y1
+        move n0,y0
+        mpy x0,y0,a
+        move n1,x0
+        macr y1,x0,a
+        move a1,x1
+
+        clr b
+
+        move y:(r6+$a),a
+        tst a
+        beq <TAIL_G1
+
+        ; --- DECIM=4: no capture at this position, only G0 captures
+        ; (1-in-4 real-sample cadence, free -- just confining capture
+        ; to 1 of the 4 group-local positions). G1/G2/G3 do grain
+        ; playback only. See the .equ DECIM comment above. ---
+
+        move n7,a
+        move r0,x0
+        add x0,a
+        move #>256,x0
+        cmp x0,a
+        blt <PB_NOADV_G1
+        sub #>256,a
+        move a1,n7
+        move n6,a
+        add #>1,a
+        move n5,x0
+        cmp x0,a
+        blt <LOOPPOS_OK_G1
+        clr a
+LOOPPOS_OK_G1:
+        move a1,n6
+
+        move n6,x0
+        move n4,y0
+        mpy x0,y0,a
+        asr a
+        move a0,a
+        move y:(r6+$1a),x0
+        add x0,a
+        cmp #>LOGICAL_BUFLEN,a
+        blt <GADDR_OK_G1
+        sub #>LOGICAL_BUFLEN,a
+GADDR_OK_G1:
+        move a1,x0
+        asr #1,a,a
+        move a1,n3
+        move x0,a
+        and #>1,a
+        bne <GREAD_BOTTOM_G1
+        move y:(r3+n3),b
+        asr #12,b,b
+        move b1,a
+        asl #12,a,a
+        bra <GREAD_DONE_G1
+GREAD_BOTTOM_G1:
+        move y:(r3+n3),b
+        asl #12,b,b
+        move b1,a
+        asr #12,a,a
+        move a1,b
+        asl #12,b,b
+        move b1,a
+GREAD_DONE_G1:
+        move a1,y0
+
+        move y0,a
+        move y:(r6+$17),x0
+        sub x0,a
+        asr a
+        move a1,x0
+        move n2,y0
+        mpy x0,y0,a
+        asl a
+        move a1,y:(r6+$18)
+        bra <PB_SAME_G1
+PB_NOADV_G1:
+        move a1,n7
+PB_SAME_G1:
+        move y:(r6+$18),x0
+        move y:(r6+$1b),y0
+        mpy x0,y0,a
+        move y:(r6+$17),x0
+        add x0,a
+        move a1,y:(r6+$17)
+        move a1,b
+        bra <TAIL_G1
+TAIL_G1:
+        move r1,y0
+        mpy x1,y0,a
+        move r4,y0
+        move b1,x0
+        macr x0,y0,a
+        move a,y:(r7)+
+
+        ; ================= SAMPLE (group-local position 2) =================
+        move y:(r2)+,x0
+        move y:(r5)+,y1
+        move n0,y0
+        mpy x0,y0,a
+        move n1,x0
+        macr y1,x0,a
+        move a1,x1
+
+        clr b
+
+        move y:(r6+$a),a
+        tst a
+        beq <TAIL_G2
+
+        ; --- DECIM=4 -- see G1's own comment above. Capture confined
+        ; to G0 only.
+
+        move n7,a
+        move r0,x0
+        add x0,a
+        move #>256,x0
+        cmp x0,a
+        blt <PB_NOADV_G2
+        sub #>256,a
+        move a1,n7
+        move n6,a
+        add #>1,a
+        move n5,x0
+        cmp x0,a
+        blt <LOOPPOS_OK_G2
+        clr a
+LOOPPOS_OK_G2:
+        move a1,n6
+
+        move n6,x0
+        move n4,y0
+        mpy x0,y0,a
+        asr a
+        move a0,a
+        move y:(r6+$1a),x0
+        add x0,a
+        cmp #>LOGICAL_BUFLEN,a
+        blt <GADDR_OK_G2
+        sub #>LOGICAL_BUFLEN,a
+GADDR_OK_G2:
+        move a1,x0
+        asr #1,a,a
+        move a1,n3
+        move x0,a
+        and #>1,a
+        bne <GREAD_BOTTOM_G2
+        move y:(r3+n3),b
+        asr #12,b,b
+        move b1,a
+        asl #12,a,a
+        bra <GREAD_DONE_G2
+GREAD_BOTTOM_G2:
+        move y:(r3+n3),b
+        asl #12,b,b
+        move b1,a
+        asr #12,a,a
+        move a1,b
+        asl #12,b,b
+        move b1,a
+GREAD_DONE_G2:
+        move a1,y0
+
+        move y0,a
+        move y:(r6+$17),x0
+        sub x0,a
+        asr a
+        move a1,x0
+        move n2,y0
+        mpy x0,y0,a
+        asl a
+        move a1,y:(r6+$18)
+        bra <PB_SAME_G2
+PB_NOADV_G2:
+        move a1,n7
+PB_SAME_G2:
+        move y:(r6+$18),x0
+        move y:(r6+$1b),y0
+        mpy x0,y0,a
+        move y:(r6+$17),x0
+        add x0,a
+        move a1,y:(r6+$17)
+        move a1,b
+        bra <TAIL_G2
+TAIL_G2:
+        move r1,y0
+        mpy x1,y0,a
+        move r4,y0
+        move b1,x0
+        macr x0,y0,a
+        move a,y:(r7)+
+
+        ; ================= SAMPLE (group-local position 3) =================
+        move y:(r2)+,x0
+        move y:(r5)+,y1
+        move n0,y0
+        mpy x0,y0,a
+        move n1,x0
+        macr y1,x0,a
+        move a1,x1
+
+        clr b
+
+        move y:(r6+$a),a
+        tst a
+        beq <TAIL_G3
+
+        ; --- DECIM=4 -- see G1's own comment above. Capture confined
+        ; to G0 only.
+
+        move n7,a
+        move r0,x0
+        add x0,a
+        move #>256,x0
+        cmp x0,a
+        blt <PB_NOADV_G3
+        sub #>256,a
+        move a1,n7
+        move n6,a
+        add #>1,a
+        move n5,x0
+        cmp x0,a
+        blt <LOOPPOS_OK_G3
+        clr a
+LOOPPOS_OK_G3:
+        move a1,n6
+
+        move n6,x0
+        move n4,y0
+        mpy x0,y0,a
+        asr a
+        move a0,a
+        move y:(r6+$1a),x0
+        add x0,a
+        cmp #>LOGICAL_BUFLEN,a
+        blt <GADDR_OK_G3
+        sub #>LOGICAL_BUFLEN,a
+GADDR_OK_G3:
+        move a1,x0
+        asr #1,a,a
+        move a1,n3
+        move x0,a
+        and #>1,a
+        bne <GREAD_BOTTOM_G3
+        move y:(r3+n3),b
+        asr #12,b,b
+        move b1,a
+        asl #12,a,a
+        bra <GREAD_DONE_G3
+GREAD_BOTTOM_G3:
+        move y:(r3+n3),b
+        asl #12,b,b
+        move b1,a
+        asr #12,a,a
+        move a1,b
+        asl #12,b,b
+        move b1,a
+GREAD_DONE_G3:
+        move a1,y0
+
+        move y0,a
+        move y:(r6+$17),x0
+        sub x0,a
+        asr a
+        move a1,x0
+        move n2,y0
+        mpy x0,y0,a
+        asl a
+        move a1,y:(r6+$18)
+        bra <PB_SAME_G3
+PB_NOADV_G3:
+        move a1,n7
+PB_SAME_G3:
+        move y:(r6+$18),x0
+        move y:(r6+$1b),y0
+        mpy x0,y0,a
+        move y:(r6+$17),x0
+        add x0,a
+        move a1,y:(r6+$17)
+        move a1,b
+        bra <TAIL_G3
+TAIL_G3:
+        move r1,y0
+        mpy x1,y0,a
+        move r4,y0
+        move b1,x0
+        macr x0,y0,a
+        move a,y:(r7)+
+RENDER_END:
+        ; persist n6/n7 (LOOP_POS/PB_FRAC) back to Y-memory once per block
+        move n6,y:(r6+$13) ; LOOP_POS
+        move n7,y:(r6+$14) ; PB_FRAC
+        rts

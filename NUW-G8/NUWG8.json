@@ -1,0 +1,29 @@
+{
+  "id": "org.mathsmechanic.nuwg8",
+  "display_name": "NUW-G8",
+  "description": "granular synth voice -- freezes a short 12-bit neighbour capture (1-in-4 real samples, DECIM=4), then loops a grain assembled by striding across it (GRAN/SHFT), tuned in half-semitone steps (PITCH) for melodic p-locking. Hardware-tested and settled on DECIM=4 after an A/B cycle-cost/sound pass against DECIM=1 and DECIM=2.",
+  "category": "NUW",
+  "short_label": "G8",
+  "neighbour": true,
+  "params": [
+    { "name": "NBAL", "default": 3, "transform": "unipolar_q23" },
+    { "name": "GATE", "default": 0, "transform": "unipolar_q23" },
+    { "name": "REC", "default": 127, "transform": "unipolar_q23" },
+    { "name": "GRAN", "default": 16, "transform": "unipolar_q23" },
+    { "name": "SHFT", "default": 0, "transform": "unipolar_q23" },
+    { "name": "PTCH", "default": 64, "transform": "bipolar_q23" },
+    { "name": "FADE", "default": 0, "transform": "unipolar_q23" },
+    { "name": "MIX", "default": 64, "transform": "unipolar_q23" }
+  ],
+  "program": {
+    "y_workset_words": 29,
+    "relocations": [
+      "RENDER_LOOP",
+      "PITCH_TABLE_REF",
+      "GRAN_RECIP_TABLE_REF"
+    ],
+    "imports": [
+      { "symbol": "TRACKMEM", "abi_symbol": 6 }
+    ]
+  }
+}

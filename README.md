@@ -20,8 +20,33 @@ it does, its parameters, build/install instructions, and status.
   plays its own capture buffer through once, optionally blending a fresh
   live capture back in (REC) instead of a decaying repeat train. Built from
   NFX-BO's patterns; 12-bit sample packing doubles its capture length.
+<<<<<<< HEAD
 - [`NUW-TS/`](NUW-TS/) — forks of NUW-JT adding a
   bidirectional tape-speed/pitch-bend knob (SPED) on playback only
+=======
+- [`NUW-TS/`](NUW-TS/) — a fork of NUW-JT adding a bidirectional
+  tape-speed/pitch-bend knob (SPED) on playback only, via a
+  continuous-linear rate derivation.
+- [`NUW-G8/`](NUW-G8/) — Neighbour User Wave Granulator: freezes a short
+  12-bit neighbour capture (1-in-4 real samples, `DECIM=4`), then loops a
+  synthesis grain assembled by striding across it (`GRAN`/`SHFT`), tuned in
+  half-semitone steps (`PTCH`) for melodic p-locking. `REC` is a genuine
+  convex-combination crossfade, not the rest of the family's additive one.
+  Confirmed working on real hardware; settled on `DECIM=4` after an A/B
+  cycle-cost/sound pass against `DECIM=1`/`2` and a loop-folded structural
+  variant (see `DESIGN.md` for that history).
+
+**Shelved** (moved to `Shelved/`, gitignored — not part of the active
+lineup, kept locally for reference):
+
+- `NUW-PT` — the same SPED-on-playback fork as NUW-TS, but deriving
+  SPED's rate via a semitone-table + interpolation scheme instead,
+  built specifically to A/B compare against NUW-TS on cycle cost. TS
+  came out both cheaper and the user's preference, so PT was shelved
+  rather than retired-and-merged the way the old NFX-BO was.
+- `SYN-PX` — an original synth voice (not an NFX/neighbour effect like
+  the others): tone + noise with a pitch sweep and snap/decay envelope.
+>>>>>>> f1c8174 (Add a new machine - Neighbour-UW-Granul-8)
 
 ## `refs/`
 
@@ -59,8 +84,8 @@ cloned as sibling directories (next to this repo's own parent, under
 machine:
 
 ```sh
-python build.py NUW-TS              # full build: assemble, pack+certify, sysex-encode
-python build.py NFX-BO --slot 1     # override the destination USR slot
+python build.py NUW-TS              # full build: assemble, pack+certify, sysex-encode (defaults to slot 1)
+python build.py NFX-BO --slot 3     # encode for a different destination USR slot -- doesn't have to match install time
 python build.py SYN-PX --draft      # skip certify for a quick sanity check (produces an uninstallable DRAFT .mds, no .syx)
 ```
 
@@ -105,8 +130,10 @@ Flash the resulting `.syx` to the Machinedrum over MIDI to install it into
 a USR machine slot (U01–U16). Only install machine code from sources you
 trust — it runs directly on the DSP.
 
-See each machine's own README for machine-specific build notes (its exact
-slot convention, any extra build flags) beyond this general pipeline.
+See each machine's own README for machine-specific build notes (any extra
+build flags) beyond this general pipeline. There's no repo-wide slot
+convention — the `--slot` baked into a `.syx` is just a default; pick
+whatever free slot you actually want at install time in C6.
 
 ## License
 
