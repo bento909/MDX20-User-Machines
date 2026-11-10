@@ -20,13 +20,8 @@ it does, its parameters, build/install instructions, and status.
   plays its own capture buffer through once, optionally blending a fresh
   live capture back in (REC) instead of a decaying repeat train. Built from
   NFX-BO's patterns; 12-bit sample packing doubles its capture length.
-- [`NUW-PT/`](NUW-PT/) / [`NUW-TS/`](NUW-TS/) — forks of NUW-JT adding a
-  bidirectional tape-speed/pitch-bend knob (SPED) on playback only, via two
-  different rate-derivation schemes (semitone-table vs. continuous-linear)
-  for a cycle-cost comparison on an otherwise identical engine.
-- [`SYN-PX/`](SYN-PX/) — an original synth voice (not an NFX/neighbour
-  effect like the others): tone + noise with a pitch sweep and snap/decay
-  envelope.
+- [`NUW-TS/`](NUW-TS/) — forks of NUW-JT adding a
+  bidirectional tape-speed/pitch-bend knob (SPED) on playback only
 
 ## `refs/`
 
